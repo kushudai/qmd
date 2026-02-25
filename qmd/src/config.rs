@@ -1,24 +1,18 @@
-//! Configuration constants and utilities.
+//! Platform-aware path resolution (XDG-style).
+//!
+//! All qmd data lives under standard platform directories:
+//! - **Database**: `~/.cache/qmd/{index}.sqlite`
+//! - **Config**:   `~/.config/qmd/{index}.yml` (override: `$QMD_CONFIG_DIR`)
+//! - **Models**:   `~/.cache/qmd/models/`
 
-/// Default glob pattern for markdown files.
+use std::path::PathBuf;
+
+use crate::error::{Error, Result};
+
+/// Default glob pattern for markdown file discovery.
 pub const DEFAULT_GLOB: &str = "**/*.md";
 
-/// Default maximum bytes for multi-get operations (10KB).
-pub const DEFAULT_MULTI_GET_MAX_BYTES: usize = 10 * 1024;
-
-/// Chunk size in tokens for embedding.
-pub const CHUNK_SIZE_TOKENS: usize = 800;
-
-/// Chunk overlap in tokens (15% of chunk size).
-pub const CHUNK_OVERLAP_TOKENS: usize = CHUNK_SIZE_TOKENS * 15 / 100;
-
-/// Chunk size in characters (approx 4 chars per token).
-pub const CHUNK_SIZE_CHARS: usize = CHUNK_SIZE_TOKENS * 4;
-
-/// Chunk overlap in characters.
-pub const CHUNK_OVERLAP_CHARS: usize = CHUNK_OVERLAP_TOKENS * 4;
-
-/// Directories to exclude from indexing.
+/// Directories always excluded from indexing.
 pub const EXCLUDE_DIRS: &[&str] = &[
     "node_modules",
     ".git",
@@ -29,43 +23,44 @@ pub const EXCLUDE_DIRS: &[&str] = &[
     "target",
 ];
 
-/// Get the default database path.
+/// Resolve the database path for a named index.
 ///
-/// Returns `~/.cache/qmd/index.sqlite` on Unix-like systems.
-#[must_use]
-pub fn get_default_db_path(index_name: &str) -> Option<std::path::PathBuf> {
-    let cache_dir = dirs::cache_dir()?;
-    let qmd_cache = cache_dir.join("qmd");
-    std::fs::create_dir_all(&qmd_cache).ok()?;
-    Some(qmd_cache.join(format!("{index_name}.sqlite")))
+/// Returns `~/.cache/qmd/{index_name}.sqlite`, creating parent dirs.
+pub fn db_path(index_name: &str) -> Result<PathBuf> {
+    let dir = dirs::cache_dir()
+        .ok_or_else(|| Error::Config("cannot determine cache directory".into()))?
+        .join("qmd");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("{index_name}.sqlite")))
 }
 
-/// Get the default config directory.
+/// Resolve the config directory.
 ///
-/// Returns `~/.config/qmd` on Unix-like systems.
-#[must_use]
-pub fn get_config_dir() -> Option<std::path::PathBuf> {
+/// Uses `$QMD_CONFIG_DIR` if set, otherwise `~/.config/qmd`.
+pub fn config_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("QMD_CONFIG_DIR") {
-        return Some(std::path::PathBuf::from(dir));
+        return Ok(PathBuf::from(dir));
     }
-    let config_dir = dirs::config_dir()?;
-    Some(config_dir.join("qmd"))
+    dirs::config_dir()
+        .map(|d| d.join("qmd"))
+        .ok_or_else(|| Error::Config("cannot determine config directory".into()))
 }
 
-/// Get the config file path for a given index name.
-#[must_use]
-pub fn get_config_path(index_name: &str) -> Option<std::path::PathBuf> {
-    let config_dir = get_config_dir()?;
-    Some(config_dir.join(format!("{index_name}.yml")))
-}
-
-/// Get the model cache directory.
+/// Resolve the config file path for a named index.
 ///
-/// Returns `~/.cache/qmd/models` on Unix-like systems.
-#[must_use]
-pub fn get_model_cache_dir() -> std::path::PathBuf {
-    let cache_dir = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let model_dir = cache_dir.join("qmd").join("models");
-    let _ = std::fs::create_dir_all(&model_dir);
-    model_dir
+/// Returns `~/.config/qmd/{index_name}.yml`.
+pub fn config_path(index_name: &str) -> Result<PathBuf> {
+    Ok(config_dir()?.join(format!("{index_name}.yml")))
+}
+
+/// Resolve the model cache directory.
+///
+/// Returns `~/.cache/qmd/models/`, creating it if needed.
+pub fn model_cache_dir() -> Result<PathBuf> {
+    let dir = dirs::cache_dir()
+        .ok_or_else(|| Error::Config("cannot determine cache directory".into()))?
+        .join("qmd")
+        .join("models");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }

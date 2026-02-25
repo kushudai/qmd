@@ -1,47 +1,47 @@
-//! Error types for the qmd application.
+//! Crate-level error types.
 
 use thiserror::Error;
 
-/// Main error type for qmd operations.
+/// Unified error type for all qmd operations.
 #[derive(Error, Debug)]
 #[non_exhaustive]
-pub enum QmdError {
-    /// Database error from rusqlite.
-    #[error("Database error: {0}")]
+pub enum Error {
+    /// SQLite / rusqlite error.
+    #[error("database: {0}")]
     Database(#[from] rusqlite::Error),
 
-    /// IO error.
-    #[error("IO error: {0}")]
+    /// Filesystem I/O error.
+    #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    /// YAML parsing error.
-    #[error("YAML error: {0}")]
+    /// YAML serialization error.
+    #[error("yaml: {0}")]
     Yaml(#[from] serde_yaml::Error),
 
-    /// JSON parsing error.
-    #[error("JSON error: {0}")]
+    /// JSON serialization error.
+    #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// HTTP request error.
+    #[error("http: {0}")]
+    Http(#[from] reqwest::Error),
+
+    /// Configuration or path resolution error.
+    #[error("config: {0}")]
+    Config(String),
+
     /// Collection not found.
-    #[error("Collection not found: {0}")]
+    #[error("collection not found: {0}")]
     CollectionNotFound(String),
 
     /// Document not found.
-    #[error("Document not found: {0}")]
+    #[error("document not found: {0}")]
     DocumentNotFound(String),
 
-    /// Invalid path.
-    #[error("Invalid path: {0}")]
-    InvalidPath(String),
-
-    /// Configuration error.
-    #[error("Configuration error: {0}")]
-    Config(String),
-
-    /// General error with message.
-    #[error("{0}")]
-    General(String),
+    /// Model download, loading, or inference error.
+    #[error("model: {0}")]
+    Model(String),
 }
 
-/// Result type alias for qmd operations.
-pub type Result<T> = std::result::Result<T, QmdError>;
+/// Crate-level result alias.
+pub type Result<T> = std::result::Result<T, Error>;

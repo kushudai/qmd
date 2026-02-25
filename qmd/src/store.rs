@@ -3,126 +3,20 @@
 //! This module provides all database operations, search functions, and document
 //! retrieval for QMD.
 
-use crate::collections::{find_context_for_path, list_collections as yaml_list_collections};
-use crate::config::{EXCLUDE_DIRS, get_default_db_path};
-use crate::error::{QmdError, Result};
-use rusqlite::{Connection, OptionalExtension, params};
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Normalize path separators to forward slashes (Unix-style).
-/// This ensures consistent path handling across platforms.
-#[must_use]
-pub fn normalize_path_separators(path: &str) -> String {
-    path.replace('\\', "/")
-}
+use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 
-/// Convert Git Bash style path (/c/Users/...) to Windows path (C:/Users/...).
-/// Returns the original path if not a Git Bash format.
-#[must_use]
-pub fn convert_git_bash_path(path: &str) -> String {
-    let normalized = normalize_path_separators(path);
-
-    // Check for Git Bash format: /c/... or /d/...
-    if normalized.len() >= 3
-        && normalized.starts_with('/')
-        && normalized
-            .chars()
-            .nth(1)
-            .map_or(false, |c| c.is_ascii_alphabetic())
-        && normalized.chars().nth(2) == Some('/')
-    {
-        let drive_letter = normalized.chars().nth(1).unwrap().to_ascii_uppercase();
-        return format!("{}:{}", drive_letter, &normalized[2..]);
-    }
-
-    normalized
-}
-
-/// Normalize a filesystem path for cross-platform compatibility.
-/// Handles Windows backslashes and Git Bash paths.
-#[must_use]
-pub fn normalize_filesystem_path(path: &str) -> String {
-    let converted = convert_git_bash_path(path);
-    normalize_path_separators(&converted)
-}
-
-/// Check if a path is absolute (works on both Windows and Unix).
-#[must_use]
-pub fn is_absolute_path(path: &str) -> bool {
-    let normalized = normalize_path_separators(path);
-
-    // Unix absolute path
-    if normalized.starts_with('/') {
-        return true;
-    }
-
-    // Windows absolute path (C:/ or C:\)
-    if normalized.len() >= 3 {
-        let chars: Vec<char> = normalized.chars().take(3).collect();
-        if chars[0].is_ascii_alphabetic()
-            && chars[1] == ':'
-            && (chars[2] == '/' || chars[2] == '\\')
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Document result with all metadata.
-#[derive(Debug, Clone)]
-pub struct DocumentResult {
-    /// Full filesystem path.
-    pub filepath: String,
-    /// Short display path.
-    pub display_path: String,
-    /// Document title.
-    pub title: String,
-    /// Folder context description if configured.
-    pub context: Option<String>,
-    /// Content hash.
-    pub hash: String,
-    /// Short docid (first 6 chars of hash).
-    pub docid: String,
-    /// Parent collection name.
-    pub collection_name: String,
-    /// Relative path within collection.
-    pub path: String,
-    /// Last modification timestamp.
-    pub modified_at: String,
-    /// Body length in bytes.
-    pub body_length: usize,
-    /// Document body (optional).
-    pub body: Option<String>,
-}
-
-/// Search result with score.
-#[derive(Debug, Clone)]
-pub struct SearchResult {
-    /// The document result.
-    pub doc: DocumentResult,
-    /// Relevance score.
-    pub score: f64,
-    /// Source of the result.
-    pub source: SearchSource,
-    /// Chunk position for vector search results (0-indexed).
-    pub chunk_pos: Option<usize>,
-}
-
-/// Search source type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchSource {
-    /// Full-text search.
-    Fts,
-    /// Vector similarity search.
-    Vec,
-}
+use crate::collections::ConfigManager;
+use crate::config;
+use crate::document::{Document, SearchResult, SearchSource};
+use crate::error::{Error, Result};
 
 /// Collection info from database.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CollectionInfo {
     /// Collection name.
     pub name: String,
@@ -136,17 +30,82 @@ pub struct CollectionInfo {
     pub last_modified: Option<String>,
 }
 
-/// Index status information.
+/// Unified index statistics and health.
 #[derive(Debug, Clone)]
-pub struct IndexStatus {
+#[non_exhaustive]
+pub struct IndexStats {
     /// Total active documents.
-    pub total_documents: usize,
+    pub total_docs: usize,
     /// Documents needing embedding.
     pub needs_embedding: usize,
-    /// Whether vector index exists.
-    pub has_vector_index: bool,
-    /// Collection information.
+    /// Whether the vector table exists.
+    pub has_vectors: bool,
+    /// Days since last update (`None` if never indexed).
+    pub days_stale: Option<u64>,
+    /// Per-collection info.
     pub collections: Vec<CollectionInfo>,
+}
+
+impl IndexStats {
+    /// Whether the index is considered healthy.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        #[allow(clippy::cast_precision_loss)]
+        let embedding_ok = self.needs_embedding == 0
+            || (self.needs_embedding as f64 / self.total_docs.max(1) as f64) < 0.1;
+        let fresh = self.days_stale.is_none() || self.days_stale < Some(14);
+        embedding_ok && fresh
+    }
+}
+
+/// A file entry returned by [`Store::list_files`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FileEntry {
+    /// Relative path within the collection.
+    pub path: String,
+    /// Document title.
+    pub title: String,
+    /// Last modification timestamp.
+    pub modified_at: String,
+    /// Body size in bytes.
+    pub size: usize,
+}
+
+/// A document that needs embedding.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct UnembeddedDoc {
+    /// Content hash.
+    pub hash: String,
+    /// File path.
+    pub path: String,
+    /// Full document body.
+    pub body: String,
+}
+
+/// A fuzzy-matched file.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct FuzzyMatch {
+    /// Virtual display path.
+    pub display: String,
+    /// Raw file path.
+    pub path: String,
+    /// Match score.
+    pub score: i64,
+}
+
+/// An active document record (used during indexing).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ActiveDoc {
+    /// Database row id.
+    pub id: i64,
+    /// Content hash.
+    pub hash: String,
+    /// Document title.
+    pub title: String,
 }
 
 /// The database store.
@@ -156,30 +115,50 @@ pub struct Store {
     conn: Connection,
     /// Database file path.
     db_path: PathBuf,
+    /// Collection configuration manager.
+    config: ConfigManager,
 }
 
 impl Store {
-    /// Create a new store with default database path.
+    /// Create a new store with the default index name (`"index"`).
     pub fn new() -> Result<Self> {
-        let db_path = get_default_db_path("index")
-            .ok_or_else(|| QmdError::Config("Could not determine database path".to_string()))?;
-        Self::open(&db_path)
+        Self::with_index("index")
     }
 
-    /// Create a new store with explicit database path.
-    pub fn open(db_path: &Path) -> Result<Self> {
-        // Ensure parent directory exists.
+    /// Create a store for a named index.
+    pub fn with_index(index_name: &str) -> Result<Self> {
+        let db_path = config::db_path(index_name)?;
+        Self::open(&db_path, ConfigManager::new(index_name))
+    }
+
+    /// Open a store at an explicit path with default configuration.
+    ///
+    /// Convenient for examples and tests. For production use, prefer
+    /// [`Store::open`] with an explicit [`ConfigManager`].
+    pub fn open_path(db_path: &Path) -> Result<Self> {
+        Self::open(db_path, ConfigManager::default())
+    }
+
+    /// Open a store at an explicit database path with a specific config.
+    pub fn open(db_path: &Path, config: ConfigManager) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let conn = Connection::open(db_path)?;
-        let mut store = Self {
+        let store = Self {
             conn,
             db_path: db_path.to_path_buf(),
+            config,
         };
         store.initialize()?;
         Ok(store)
+    }
+
+    /// Get a reference to the underlying `ConfigManager`.
+    #[must_use]
+    pub const fn config(&self) -> &ConfigManager {
+        &self.config
     }
 
     /// Get the database path.
@@ -189,7 +168,7 @@ impl Store {
     }
 
     /// Initialize database schema.
-    fn initialize(&mut self) -> Result<()> {
+    fn initialize(&self) -> Result<()> {
         self.conn.execute_batch(
             r"
             PRAGMA journal_mode = WAL;
@@ -300,7 +279,7 @@ impl Store {
         Ok(())
     }
 
-    /// Hash content using SHA256.
+    /// Hash content using SHA-256, returning a lowercase hex string.
     #[must_use]
     pub fn hash_content(content: &str) -> String {
         let mut hasher = Sha256::new();
@@ -308,44 +287,29 @@ impl Store {
         format!("{:x}", hasher.finalize())
     }
 
-    /// Get short docid from hash (first 6 characters).
-    #[must_use]
-    pub fn get_docid(hash: &str) -> String {
-        hash.chars().take(6).collect()
-    }
-
-    /// Extract title from markdown content.
+    /// Extract the first heading from markdown content as a title.
     #[must_use]
     pub fn extract_title(content: &str) -> String {
         for line in content.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("# ") {
-                return trimmed[2..].trim().to_string();
+            if let Some(rest) = trimmed.strip_prefix("# ") {
+                return rest.trim().to_string();
             }
-            if trimmed.starts_with("## ") {
-                return trimmed[3..].trim().to_string();
+            if let Some(rest) = trimmed.strip_prefix("## ") {
+                return rest.trim().to_string();
             }
         }
         String::new()
     }
 
-    /// Handelize a path to be more token-friendly.
-    #[must_use]
-    pub fn handelize(path: &str) -> String {
-        path.replace("___", "/")
-            .to_lowercase()
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(|segment| {
-                let cleaned: String = segment
-                    .chars()
-                    .map(|c| if c.is_alphanumeric() { c } else { '-' })
-                    .collect();
-                cleaned.trim_matches('-').to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("/")
+    /// Attach folder context descriptions to search results.
+    fn attach_context(&self, results: &mut [SearchResult]) {
+        for r in results.iter_mut() {
+            r.doc.context = self
+                .config
+                .find_context(&r.doc.collection, &r.doc.path)
+                .unwrap_or(None);
+        }
     }
 
     /// Insert content into content-addressable storage.
@@ -387,33 +351,25 @@ impl Store {
         &self,
         collection: &str,
         path: &str,
-    ) -> Result<Option<(i64, String, String)>> {
+    ) -> Result<Option<ActiveDoc>> {
         let result = self
             .conn
             .query_row(
                 "SELECT id, hash, title FROM documents WHERE collection = ?1 AND path = ?2 AND active = 1",
                 params![collection, path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok(ActiveDoc {
+                        id: row.get(0)?,
+                        hash: row.get(1)?,
+                        title: row.get(2)?,
+                    })
+                },
             )
             .optional()?;
         Ok(result)
     }
 
-    /// Update document title.
-    pub fn update_document_title(
-        &self,
-        document_id: i64,
-        title: &str,
-        modified_at: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE documents SET title = ?1, modified_at = ?2 WHERE id = ?3",
-            params![title, modified_at, document_id],
-        )?;
-        Ok(())
-    }
-
-    /// Update document hash and title.
+    /// Update document hash, title, and timestamp.
     pub fn update_document(
         &self,
         document_id: i64,
@@ -455,173 +411,90 @@ impl Store {
         limit: usize,
         collection: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        let sql = if collection.is_some() {
-            r"
-            SELECT
-                d.collection,
-                d.path,
-                d.title,
-                d.hash,
-                d.modified_at,
-                bm25(documents_fts) as score,
-                LENGTH(c.doc) as body_length
-            FROM documents_fts fts
-            JOIN documents d ON d.id = fts.rowid
-            JOIN content c ON c.hash = d.hash
-            WHERE documents_fts MATCH ?1
-              AND d.collection = ?2
-              AND d.active = 1
-            ORDER BY score
-            LIMIT ?3
-            "
+        let coll_filter = if collection.is_some() {
+            "AND d.collection = ?2"
         } else {
-            r"
-            SELECT
-                d.collection,
-                d.path,
-                d.title,
-                d.hash,
-                d.modified_at,
-                bm25(documents_fts) as score,
-                LENGTH(c.doc) as body_length
-            FROM documents_fts fts
-            JOIN documents d ON d.id = fts.rowid
-            JOIN content c ON c.hash = d.hash
-            WHERE documents_fts MATCH ?1
-              AND d.active = 1
-            ORDER BY score
-            LIMIT ?2
-            "
+            ""
         };
+        let limit_param = if collection.is_some() { "?3" } else { "?2" };
 
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = format!(
+            r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
+                     bm25(documents_fts) as score, LENGTH(c.doc)
+              FROM documents_fts fts
+              JOIN documents d ON d.id = fts.rowid
+              JOIN content c ON c.hash = d.hash
+              WHERE documents_fts MATCH ?1 {coll_filter} AND d.active = 1
+              ORDER BY score
+              LIMIT {limit_param}"
+        );
 
-        let results: Vec<SearchResult> = if let Some(coll) = collection {
-            stmt.query_map(params![query, coll, limit as i64], |row| {
-                let collection_name: String = row.get(0)?;
-                let path: String = row.get(1)?;
-                let title: String = row.get(2)?;
-                let hash: String = row.get(3)?;
-                let modified_at: String = row.get(4)?;
-                let score: f64 = row.get(5)?;
-                let body_length: i64 = row.get(6)?;
-                let body_length = body_length as usize;
-
-                Ok(SearchResult {
-                    doc: DocumentResult {
-                        filepath: format!("qmd://{collection_name}/{path}"),
-                        display_path: format!("{collection_name}/{path}"),
-                        title,
-                        context: None,
-                        hash: hash.clone(),
-                        docid: Self::get_docid(&hash),
-                        collection_name,
-                        path,
-                        modified_at,
-                        body_length,
-                        body: None,
-                    },
-                    score: -score, // BM25 returns negative scores, higher is better.
-                    source: SearchSource::Fts,
-                    chunk_pos: None,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-        } else {
-            stmt.query_map(params![query, limit as i64], |row| {
-                let collection_name: String = row.get(0)?;
-                let path: String = row.get(1)?;
-                let title: String = row.get(2)?;
-                let hash: String = row.get(3)?;
-                let modified_at: String = row.get(4)?;
-                let score: f64 = row.get(5)?;
-                let body_length: i64 = row.get(6)?;
-                let body_length = body_length as usize;
-
-                Ok(SearchResult {
-                    doc: DocumentResult {
-                        filepath: format!("qmd://{collection_name}/{path}"),
-                        display_path: format!("{collection_name}/{path}"),
-                        title,
-                        context: None,
-                        hash: hash.clone(),
-                        docid: Self::get_docid(&hash),
-                        collection_name,
-                        path,
-                        modified_at,
-                        body_length,
-                        body: None,
-                    },
-                    score: -score,
-                    source: SearchSource::Fts,
-                    chunk_pos: None,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-
-        // Add context to results.
-        let results_with_context: Vec<SearchResult> = results
-            .into_iter()
-            .map(|mut r| {
-                r.doc.context =
-                    find_context_for_path(&r.doc.collection_name, &r.doc.path).unwrap_or(None);
-                r
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let body_len: i64 = row.get(6)?;
+            Ok(SearchResult {
+                doc: Document {
+                    collection: row.get(0)?,
+                    path: row.get(1)?,
+                    title: row.get(2)?,
+                    hash: row.get(3)?,
+                    modified_at: row.get(4)?,
+                    body_len: body_len as usize,
+                    body: None,
+                    context: None,
+                },
+                score: -row.get::<_, f64>(5)?,
+                source: SearchSource::Fts,
+                chunk_pos: None,
             })
-            .collect();
+        };
 
-        Ok(results_with_context)
+        let mut results: Vec<SearchResult> = if let Some(coll) = collection {
+            stmt.query_map(params![query, coll, limit as i64], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![query, limit as i64], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        self.attach_context(&mut results);
+        Ok(results)
     }
 
     /// Get document by collection and path.
-    pub fn get_document(&self, collection: &str, path: &str) -> Result<Option<DocumentResult>> {
+    pub fn get_document(&self, collection: &str, path: &str) -> Result<Option<Document>> {
         let result = self
             .conn
             .query_row(
                 r"
-                SELECT
-                    d.title,
-                    d.hash,
-                    d.modified_at,
-                    c.doc,
-                    LENGTH(c.doc) as body_length
+                SELECT d.title, d.hash, d.modified_at, c.doc, LENGTH(c.doc)
                 FROM documents d
                 JOIN content c ON c.hash = d.hash
                 WHERE d.collection = ?1 AND d.path = ?2 AND d.active = 1
                 ",
                 params![collection, path],
                 |row| {
-                    let title: String = row.get(0)?;
-                    let hash: String = row.get(1)?;
-                    let modified_at: String = row.get(2)?;
                     let body: String = row.get(3)?;
-                    let body_length: i64 = row.get(4)?;
-                    let body_length = body_length as usize;
-
-                    Ok(DocumentResult {
-                        filepath: format!("qmd://{collection}/{path}"),
-                        display_path: format!("{collection}/{path}"),
-                        title,
-                        context: None,
-                        hash: hash.clone(),
-                        docid: Self::get_docid(&hash),
-                        collection_name: collection.to_string(),
+                    let body_len: i64 = row.get(4)?;
+                    Ok(Document {
+                        collection: collection.to_string(),
                         path: path.to_string(),
-                        modified_at,
-                        body_length,
+                        title: row.get(0)?,
+                        hash: row.get(1)?,
+                        modified_at: row.get(2)?,
+                        body_len: body_len as usize,
                         body: Some(body),
+                        context: None,
                     })
                 },
             )
             .optional()?;
 
-        // Add context if document found.
-        let result = result.map(|mut doc| {
-            doc.context = find_context_for_path(collection, path).unwrap_or(None);
+        // Attach context.
+        Ok(result.map(|mut doc| {
+            doc.context = self.config.find_context(collection, path).unwrap_or(None);
             doc
-        });
-
-        Ok(result)
+        }))
     }
 
     /// Get document by docid (first 6 chars of hash).
@@ -645,11 +518,11 @@ impl Store {
 
     /// List collections with stats from database.
     pub fn list_collections(&self) -> Result<Vec<CollectionInfo>> {
-        let yaml_collections = yaml_list_collections()?;
+        let yaml_collections = self.config.list()?;
 
         let mut collections = Vec::new();
 
-        for coll in yaml_collections {
+        for (name, coll) in yaml_collections {
             let stats: (i64, Option<String>) = self
                 .conn
                 .query_row(
@@ -658,13 +531,13 @@ impl Store {
                     FROM documents
                     WHERE collection = ?1 AND active = 1
                     ",
-                    params![coll.name],
+                    params![name],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .unwrap_or((0, None));
 
             collections.push(CollectionInfo {
-                name: coll.name,
+                name,
                 pwd: coll.path,
                 glob_pattern: coll.pattern,
                 active_count: stats.0 as usize,
@@ -675,28 +548,24 @@ impl Store {
         Ok(collections)
     }
 
-    /// Get index status.
-    pub fn get_status(&self) -> Result<IndexStatus> {
-        let total_documents: i64 = self.conn.query_row(
+    /// Unified index statistics and health diagnostics.
+    pub fn stats(&self) -> Result<IndexStats> {
+        let total_docs = self.conn.query_row(
             "SELECT COUNT(*) FROM documents WHERE active = 1",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0).map(|v| v as usize),
         )?;
-        let total_documents = total_documents as usize;
 
-        let needs_embedding: i64 = self.conn.query_row(
-            r"
-            SELECT COUNT(DISTINCT d.hash)
-            FROM documents d
-            LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-            WHERE d.active = 1 AND v.hash IS NULL
-            ",
+        let needs_embedding = self.conn.query_row(
+            r"SELECT COUNT(DISTINCT d.hash)
+              FROM documents d
+              LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+              WHERE d.active = 1 AND v.hash IS NULL",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0).map(|v| v as usize),
         )?;
-        let needs_embedding = needs_embedding as usize;
 
-        let has_vector_index: bool = self
+        let has_vectors: bool = self
             .conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='vectors_vec'",
@@ -705,12 +574,25 @@ impl Store {
             )
             .unwrap_or(false);
 
+        let days_stale: Option<u64> = self
+            .conn
+            .query_row(
+                r"SELECT CAST(julianday('now') - julianday(MAX(modified_at)) AS INTEGER)
+                  FROM documents WHERE active = 1",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|d| d.max(0) as u64);
+
         let collections = self.list_collections()?;
 
-        Ok(IndexStatus {
-            total_documents,
+        Ok(IndexStats {
+            total_docs,
             needs_embedding,
-            has_vector_index,
+            has_vectors,
+            days_stale,
             collections,
         })
     }
@@ -718,12 +600,11 @@ impl Store {
     /// Remove a collection and its documents from the database.
     pub fn remove_collection_documents(&self, name: &str) -> Result<(usize, usize)> {
         // Get count before deletion.
-        let doc_count: i64 = self.conn.query_row(
+        let doc_count = self.conn.query_row(
             "SELECT COUNT(*) FROM documents WHERE collection = ?1",
             params![name],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0).map(|v| v as usize),
         )?;
-        let doc_count = doc_count as usize;
 
         // Delete documents.
         self.conn
@@ -831,20 +712,24 @@ impl Store {
         Ok(())
     }
 
-    /// Get hashes that need embedding.
-    pub fn get_hashes_needing_embedding(&self) -> Result<Vec<(String, String, String)>> {
+    /// Documents that need embedding.
+    pub fn unembedded_docs(&self) -> Result<Vec<UnembeddedDoc>> {
         let mut stmt = self.conn.prepare(
-            r"
-            SELECT DISTINCT d.hash, d.path, c.doc
-            FROM documents d
-            JOIN content c ON c.hash = d.hash
-            LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
-            WHERE d.active = 1 AND v.hash IS NULL
-            ",
+            r"SELECT DISTINCT d.hash, d.path, c.doc
+              FROM documents d
+              JOIN content c ON c.hash = d.hash
+              LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+              WHERE d.active = 1 AND v.hash IS NULL",
         )?;
 
         let results = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .query_map([], |row| {
+                Ok(UnembeddedDoc {
+                    hash: row.get(0)?,
+                    path: row.get(1)?,
+                    body: row.get(2)?,
+                })
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(results)
@@ -877,119 +762,72 @@ impl Store {
         limit: usize,
         collection: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
-        // Get all embeddings and compute similarity
-        let sql = if collection.is_some() {
-            r"
-            SELECT DISTINCT
-                d.collection,
-                d.path,
-                d.title,
-                d.hash,
-                d.modified_at,
-                LENGTH(c.doc) as body_length,
-                v.hash_seq
-            FROM documents d
-            JOIN content c ON c.hash = d.hash
-            JOIN vectors_vec v ON v.hash_seq = d.hash || '_0'
-            WHERE d.active = 1 AND d.collection = ?1
-            "
+        let coll_filter = if collection.is_some() {
+            "AND d.collection = ?1"
         } else {
-            r"
-            SELECT DISTINCT
-                d.collection,
-                d.path,
-                d.title,
-                d.hash,
-                d.modified_at,
-                LENGTH(c.doc) as body_length,
-                v.hash_seq
-            FROM documents d
-            JOIN content c ON c.hash = d.hash
-            JOIN vectors_vec v ON v.hash_seq = d.hash || '_0'
-            WHERE d.active = 1
-            "
+            ""
         };
 
-        let mut stmt = self.conn.prepare(sql)?;
+        let sql = format!(
+            r"SELECT DISTINCT d.collection, d.path, d.title, d.hash,
+                     d.modified_at, LENGTH(c.doc)
+              FROM documents d
+              JOIN content c ON c.hash = d.hash
+              JOIN vectors_vec v ON v.hash_seq = d.hash || '_0'
+              WHERE d.active = 1 {coll_filter}"
+        );
 
-        let rows: Vec<(String, String, String, String, String, usize, String)> =
-            if let Some(coll) = collection {
-                stmt.query_map(params![coll], |row| {
-                    let body_length: i64 = row.get(5)?;
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        body_length as usize,
-                        row.get(6)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-            } else {
-                stmt.query_map([], |row| {
-                    let body_length: i64 = row.get(5)?;
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        body_length as usize,
-                        row.get(6)?,
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-            };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let body_len: i64 = row.get(5)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                body_len as usize,
+            ))
+        };
 
-        // Compute similarities
+        let rows: Vec<_> = if let Some(coll) = collection {
+            stmt.query_map(params![coll], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map([], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
         let mut results: Vec<SearchResult> = Vec::new();
-
-        for (collection_name, path, title, hash, modified_at, body_length, _hash_seq) in rows {
-            if let Some(doc_embedding) = self.get_embedding(&hash, 0)? {
-                let similarity = crate::llm::cosine_similarity(query_embedding, &doc_embedding);
-
+        for (coll_name, path, title, hash, modified_at, body_len) in rows {
+            if let Some(emb) = self.get_embedding(&hash, 0)? {
+                let sim = crate::embed::cosine_similarity(query_embedding, &emb);
                 results.push(SearchResult {
-                    doc: DocumentResult {
-                        filepath: format!("qmd://{collection_name}/{path}"),
-                        display_path: format!("{collection_name}/{path}"),
+                    doc: Document {
+                        collection: coll_name,
+                        path,
                         title,
-                        context: None,
-                        hash: hash.clone(),
-                        docid: Self::get_docid(&hash),
-                        collection_name: collection_name.clone(),
-                        path: path.clone(),
+                        hash,
                         modified_at,
-                        body_length,
+                        body_len,
                         body: None,
+                        context: None,
                     },
-                    score: f64::from(similarity),
+                    score: f64::from(sim),
                     source: SearchSource::Vec,
-                    chunk_pos: Some(0), // First chunk (chunk position tracking)
+                    chunk_pos: Some(0),
                 });
             }
         }
 
-        // Sort by similarity (descending) and limit
         results.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         results.truncate(limit);
-
-        // Add context
-        let results_with_context: Vec<SearchResult> = results
-            .into_iter()
-            .map(|mut r| {
-                r.doc.context =
-                    find_context_for_path(&r.doc.collection_name, &r.doc.path).unwrap_or(None);
-                r
-            })
-            .collect();
-
-        Ok(results_with_context)
+        self.attach_context(&mut results);
+        Ok(results)
     }
 
     /// Clear all embeddings.
@@ -999,344 +837,128 @@ impl Store {
         Ok(changes1)
     }
 
-    /// List files in a collection.
+    /// List files in a collection, optionally filtered by path prefix.
     pub fn list_files(
         &self,
         collection: &str,
         path_prefix: Option<&str>,
-    ) -> Result<Vec<(String, String, String, usize)>> {
-        let mut stmt;
-        let files: Vec<(String, String, String, usize)> = if let Some(prefix) = path_prefix {
-            let prefix_pattern = format!("{prefix}%");
-            stmt = self.conn.prepare(
-                r"
-                SELECT d.path, d.title, d.modified_at, LENGTH(c.doc) as size
-                FROM documents d
-                JOIN content c ON d.hash = c.hash
-                WHERE d.collection = ?1 AND d.path LIKE ?2 AND d.active = 1
-                ORDER BY d.path
-                ",
-            )?;
-            stmt.query_map(params![collection, prefix_pattern], |row| {
-                let size: i64 = row.get(3)?;
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, size as usize))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+    ) -> Result<Vec<FileEntry>> {
+        let prefix_filter = if path_prefix.is_some() {
+            "AND d.path LIKE ?2"
         } else {
-            stmt = self.conn.prepare(
-                r"
-                SELECT d.path, d.title, d.modified_at, LENGTH(c.doc) as size
-                FROM documents d
-                JOIN content c ON d.hash = c.hash
-                WHERE d.collection = ?1 AND d.active = 1
-                ORDER BY d.path
-                ",
-            )?;
-            stmt.query_map(params![collection], |row| {
-                let size: i64 = row.get(3)?;
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, size as usize))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+            ""
+        };
+
+        let sql = format!(
+            r"SELECT d.path, d.title, d.modified_at, LENGTH(c.doc)
+              FROM documents d
+              JOIN content c ON d.hash = c.hash
+              WHERE d.collection = ?1 {prefix_filter} AND d.active = 1
+              ORDER BY d.path"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let size: i64 = row.get(3)?;
+            Ok(FileEntry {
+                path: row.get(0)?,
+                title: row.get(1)?,
+                modified_at: row.get(2)?,
+                size: size as usize,
+            })
+        };
+
+        let files = if let Some(prefix) = path_prefix {
+            let pattern = format!("{prefix}%");
+            stmt.query_map(params![collection, pattern], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            stmt.query_map(params![collection], map_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
         Ok(files)
     }
 
-    /// Get index health information.
-    pub fn get_index_health(&self) -> Result<crate::llm::IndexHealth> {
-        // Total documents
-        let total_docs: usize = self.conn.query_row(
-            "SELECT COUNT(*) FROM documents WHERE active = 1",
-            [],
-            |row| row.get::<_, i64>(0).map(|v| v as usize),
-        )?;
+    /// Find files similar to `query` using fuzzy matching.
+    pub fn find_similar_files(&self, query: &str, limit: usize) -> Result<Vec<FuzzyMatch>> {
+        use fuzzy_matcher::FuzzyMatcher;
+        use fuzzy_matcher::skim::SkimMatcherV2;
 
-        // Hashes needing embedding
-        let needs_embedding: usize = self.conn.query_row(
-            r"
-                SELECT COUNT(DISTINCT d.hash)
-                FROM documents d
-                LEFT JOIN content_vectors cv ON d.hash = cv.hash
-                WHERE d.active = 1 AND cv.hash IS NULL
-                ",
-            [],
-            |row| row.get::<_, i64>(0).map(|v| v as usize),
-        )?;
+        let matcher = SkimMatcherV2::default();
+        let query_lower = query.to_lowercase();
 
-        // Days since last update
-        let days_stale: Option<u64> = self
+        let mut stmt = self
             .conn
-            .query_row(
-                "SELECT MAX(modified_at) FROM documents WHERE active = 1",
-                [],
-                |row| row.get::<_, Option<String>>(0),
+            .prepare("SELECT collection, path FROM documents WHERE active = 1")?;
+
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+
+        let mut hits: Vec<FuzzyMatch> = rows
+            .into_iter()
+            .filter_map(|(collection, path)| {
+                let display = crate::path::build_virtual(&collection, &path);
+                matcher
+                    .fuzzy_match(&path.to_lowercase(), &query_lower)
+                    .map(|score| FuzzyMatch {
+                        display,
+                        path,
+                        score,
+                    })
+            })
+            .collect();
+
+        hits.sort_by(|a, b| b.score.cmp(&a.score));
+        hits.truncate(limit);
+        Ok(hits)
+    }
+
+    /// Match files using a glob pattern.
+    pub fn match_files_by_glob(&self, pattern: &str) -> Result<Vec<Document>> {
+        let glob_pattern = glob::Pattern::new(pattern).map_err(|e| Error::Config(e.to_string()))?;
+
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT d.collection, d.path, d.title, d.hash, d.modified_at, LENGTH(c.doc)
+            FROM documents d
+            JOIN content c ON d.hash = c.hash
+            WHERE d.active = 1
+            ",
+        )?;
+
+        let results: Vec<Document> = stmt
+            .query_map([], |row| {
+                let collection: String = row.get(0)?;
+                let path: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let hash: String = row.get(3)?;
+                let modified_at: String = row.get(4)?;
+                let body_length: i64 = row.get(5)?;
+                Ok((collection, path, title, hash, modified_at, body_length))
+            })?
+            .filter_map(std::result::Result::ok)
+            .filter(|(_, path, _, _, _, _)| glob_pattern.matches(path))
+            .map(
+                |(collection, path, title, hash, modified_at, body_length)| {
+                    let context = self.config.find_context(&collection, &path).ok().flatten();
+
+                    Document {
+                        collection,
+                        path,
+                        title,
+                        hash,
+                        modified_at,
+                        body_len: body_length as usize,
+                        body: None,
+                        context,
+                    }
+                },
             )
-            .ok()
-            .flatten()
-            .and_then(|ts| {
-                chrono::DateTime::parse_from_rfc3339(&ts).ok().map(|dt| {
-                    let now = chrono::Utc::now();
-                    let duration = now.signed_duration_since(dt);
-                    duration.num_days().max(0) as u64
-                })
-            });
+            .collect();
 
-        Ok(crate::llm::IndexHealth {
-            needs_embedding,
-            total_docs,
-            days_stale,
-        })
-    }
-
-    /// Check index health and print warnings if needed.
-    pub fn check_and_warn_health(&self) {
-        if let Ok(health) = self.get_index_health()
-            && let Some(msg) = health.warning_message()
-        {
-            eprintln!("{}", colored::Colorize::yellow(msg.as_str()));
-        }
-    }
-
-    /// Get total document count.
-    pub fn get_document_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM documents WHERE active = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
-
-    /// Get total unique hash count.
-    pub fn get_unique_hash_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT hash) FROM documents WHERE active = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
-
-    /// Get embedded hash count.
-    pub fn get_embedded_hash_count(&self) -> Result<usize> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT hash) FROM content_vectors",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
-    }
-}
-
-/// Check if a path should be excluded from indexing.
-#[must_use]
-pub fn should_exclude(path: &Path) -> bool {
-    for component in path.components() {
-        if let std::path::Component::Normal(name) = component {
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || EXCLUDE_DIRS.contains(&name_str.as_ref()) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Check if a string looks like a docid.
-#[must_use]
-pub fn is_docid(s: &str) -> bool {
-    let clean = s.trim_start_matches('#');
-    clean.len() == 6 && clean.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-/// Parse a virtual path like "<qmd://collection/path>".
-#[must_use]
-pub fn parse_virtual_path(path: &str) -> Option<(String, String)> {
-    let normalized = normalize_virtual_path(path);
-    let stripped = normalized.strip_prefix("qmd://")?;
-    let mut parts = stripped.splitn(2, '/');
-    let collection = parts.next()?.to_string();
-    let file_path = parts.next().unwrap_or("").to_string();
-    Some((collection, file_path))
-}
-
-/// Build a virtual path from collection and path.
-#[must_use]
-pub fn build_virtual_path(collection: &str, path: &str) -> String {
-    format!("qmd://{collection}/{path}")
-}
-
-/// Check if a path is a virtual path.
-#[must_use]
-pub fn is_virtual_path(path: &str) -> bool {
-    let trimmed = path.trim();
-    trimmed.starts_with("qmd:") || trimmed.starts_with("//")
-}
-
-/// Normalize virtual path format.
-#[must_use]
-pub fn normalize_virtual_path(input: &str) -> String {
-    let path = input.trim();
-
-    if let Some(rest) = path.strip_prefix("qmd:") {
-        let rest = rest.trim_start_matches('/');
-        return format!("qmd://{rest}");
-    }
-
-    if path.starts_with("//") {
-        let rest = path.trim_start_matches('/');
-        return format!("qmd://{rest}");
-    }
-
-    path.to_string()
-}
-
-/// Find files similar to a query using fuzzy matching.
-///
-/// Uses the `SkimMatcherV2` algorithm for fuzzy string matching.
-///
-/// # Arguments
-/// * `store` - Store instance
-/// * `query` - Search query
-/// * `max_distance` - Maximum edit distance (unused, for API compat)
-/// * `limit` - Maximum results to return
-pub fn find_similar_files(
-    store: &Store,
-    query: &str,
-    _max_distance: usize,
-    limit: usize,
-) -> Result<Vec<(String, String, i64)>> {
-    use fuzzy_matcher::FuzzyMatcher;
-    use fuzzy_matcher::skim::SkimMatcherV2;
-
-    let matcher = SkimMatcherV2::default();
-    let query_lower = query.to_lowercase();
-
-    // Get all active file paths
-    let mut stmt = store.conn.prepare(
-        r"
-        SELECT collection, path
-        FROM documents
-        WHERE active = 1
-        ",
-    )?;
-
-    let files: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(std::result::Result::ok)
-        .collect();
-
-    // Score each file
-    let mut scored: Vec<(String, String, i64)> = files
-        .into_iter()
-        .filter_map(|(collection, path)| {
-            let display_path = build_virtual_path(&collection, &path);
-            let path_lower = path.to_lowercase();
-
-            // Match against path
-            matcher
-                .fuzzy_match(&path_lower, &query_lower)
-                .map(|score| (display_path, path, score))
-        })
-        .collect();
-
-    // Sort by score descending
-    scored.sort_by(|a, b| b.2.cmp(&a.2));
-    scored.truncate(limit);
-
-    Ok(scored)
-}
-
-/// Match files using glob pattern.
-pub fn match_files_by_glob(store: &Store, pattern: &str) -> Result<Vec<DocumentResult>> {
-    let glob_pattern = glob::Pattern::new(pattern).map_err(|e| QmdError::Config(e.to_string()))?;
-
-    let mut stmt = store.conn.prepare(
-        r"
-        SELECT d.collection, d.path, d.title, d.hash, d.modified_at, LENGTH(c.doc)
-        FROM documents d
-        JOIN content c ON d.hash = c.hash
-        WHERE d.active = 1
-        ",
-    )?;
-
-    let results: Vec<DocumentResult> = stmt
-        .query_map([], |row| {
-            let collection: String = row.get(0)?;
-            let path: String = row.get(1)?;
-            let title: String = row.get(2)?;
-            let hash: String = row.get(3)?;
-            let modified_at: String = row.get(4)?;
-            let body_length: i64 = row.get(5)?;
-
-            Ok((collection, path, title, hash, modified_at, body_length))
-        })?
-        .filter_map(std::result::Result::ok)
-        .filter(|(_, path, _, _, _, _)| glob_pattern.matches(path))
-        .map(
-            |(collection, path, title, hash, modified_at, body_length)| {
-                let display_path = build_virtual_path(&collection, &path);
-                let docid = Store::get_docid(&hash);
-                let context = find_context_for_path(&collection, &path).ok().flatten();
-
-                DocumentResult {
-                    filepath: display_path.clone(),
-                    display_path,
-                    title,
-                    context,
-                    hash,
-                    docid,
-                    collection_name: collection,
-                    path,
-                    modified_at,
-                    body_length: body_length as usize,
-                    body: None,
-                }
-            },
-        )
-        .collect();
-
-    Ok(results)
-}
-
-#[cfg(test)]
-mod path_tests {
-    use super::*;
-
-    #[test]
-    fn test_normalize_path_separators() {
-        assert_eq!(normalize_path_separators(r"C:\Users\test"), "C:/Users/test");
-        assert_eq!(normalize_path_separators("C:/Users/test"), "C:/Users/test");
-        assert_eq!(normalize_path_separators("/home/user"), "/home/user");
-    }
-
-    #[test]
-    fn test_convert_git_bash_path() {
-        assert_eq!(convert_git_bash_path("/c/Users/test"), "C:/Users/test");
-        assert_eq!(convert_git_bash_path("/d/Projects/app"), "D:/Projects/app");
-        assert_eq!(convert_git_bash_path("/home/user"), "/home/user");
-        assert_eq!(convert_git_bash_path("C:/Users/test"), "C:/Users/test");
-    }
-
-    #[test]
-    fn test_normalize_filesystem_path() {
-        assert_eq!(
-            normalize_filesystem_path(r"C:\Users\test\file.md"),
-            "C:/Users/test/file.md"
-        );
-        assert_eq!(
-            normalize_filesystem_path("/c/Users/test/file.md"),
-            "C:/Users/test/file.md"
-        );
-    }
-
-    #[test]
-    fn test_is_absolute_path() {
-        assert!(is_absolute_path("/home/user"));
-        assert!(is_absolute_path("C:/Users/test"));
-        assert!(is_absolute_path(r"C:\Users\test"));
-        assert!(is_absolute_path("/c/Users/test"));
-        assert!(!is_absolute_path("relative/path"));
-        assert!(!is_absolute_path("./local"));
+        Ok(results)
     }
 }
