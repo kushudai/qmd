@@ -535,9 +535,10 @@ impl Store {
         };
         let limit_param = if collection.is_some() { "?3" } else { "?2" };
 
+        // Field weights: filepath 10×, title 1×, body 1×.
         let sql = format!(
             r"SELECT d.collection, d.path, d.title, d.hash, d.modified_at,
-                     bm25(documents_fts) as score, LENGTH(c.doc)
+                     bm25(documents_fts, 10.0, 1.0, 1.0) as score, LENGTH(c.doc)
               FROM documents_fts fts
               JOIN documents d ON d.id = fts.rowid
               JOIN content c ON c.hash = d.hash
@@ -549,6 +550,7 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let map_row = |row: &rusqlite::Row<'_>| {
             let body_len: i64 = row.get(6)?;
+            let raw_bm25: f64 = row.get(5)?;
             Ok(SearchResult {
                 doc: Document {
                     collection: row.get(0)?,
@@ -560,7 +562,7 @@ impl Store {
                     body: None,
                     context: None,
                 },
-                score: -row.get::<_, f64>(5)?,
+                score: search::normalize_bm25(-raw_bm25),
                 source: SearchSource::Fts,
                 chunk_pos: None,
             })
@@ -1053,11 +1055,7 @@ impl Store {
             }
         }
 
-        results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(limit);
         self.attach_context(&mut results);
         Ok(results)
@@ -1228,6 +1226,52 @@ impl Store {
         Ok(result)
     }
 
+    /// Get document body with optional line range.
+    ///
+    /// Returns `(text, total_lines)`.  If `from_line` or `max_lines` are
+    /// provided, only that slice is returned.  Lines are 1-indexed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails or the document is not found.
+    pub fn get_document_body(
+        &self,
+        collection: &str,
+        path: &str,
+        from_line: Option<usize>,
+        max_lines: Option<usize>,
+    ) -> Result<Option<(String, usize)>> {
+        let Some(doc) = self.get_document(collection, path)? else {
+            return Ok(None);
+        };
+        let body = doc.body.as_deref().unwrap_or("");
+        let lines: Vec<&str> = body.lines().collect();
+        let total = lines.len();
+
+        let start = from_line.unwrap_or(1).saturating_sub(1).min(total);
+        let count = max_lines.unwrap_or(total - start);
+        let end = (start + count).min(total);
+
+        let text = lines[start..end].join("\n");
+        Ok(Some((text, total)))
+    }
+
+    /// Serialize expanded queries into a cacheable string format.
+    fn serialize_queries(queries: &[search::Query]) -> String {
+        queries
+            .iter()
+            .map(|q| {
+                let kind = match q.kind {
+                    search::QueryType::Lex => "lex",
+                    search::QueryType::Vec => "vec",
+                    search::QueryType::Hyde => "hyde",
+                };
+                format!("{kind}: {}", q.text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Expand the user query into multiple sub-queries using LLM or cache.
     fn expand_queries(
         &self,
@@ -1244,34 +1288,25 @@ impl Store {
             return search::Query::from_llm_output(&cached, query);
         }
 
-        generator.map_or_else(
-            || search::Query::expand_simple(query),
-            |engine| {
-                engine.expand_query(query, true).map_or_else(
-                    |_| search::Query::expand_simple(query),
-                    |expanded| {
-                        // Cache the raw LLM output for next time.
-                        let raw: String = expanded
-                            .iter()
-                            .map(|q| {
-                                let kind = match q.kind {
-                                    search::QueryType::Lex => "lex",
-                                    search::QueryType::Vec => "vec",
-                                    search::QueryType::Hyde => "hyde",
-                                };
-                                format!("{kind}: {}", q.text)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        let _ = self.cache_set(&cache_key, &raw);
-                        expanded
-                    },
-                )
-            },
-        )
+        // Safety: generator.is_none() is handled by early return above.
+        let engine = generator.unwrap_or_else(|| unreachable!());
+        let Ok(expanded) = engine.expand_query(query, true) else {
+            return search::Query::expand_simple(query);
+        };
+
+        // Cache the raw LLM output for next time.
+        let raw = Self::serialize_queries(&expanded);
+        let _ = self.cache_set(&cache_key, &raw);
+        expanded
     }
 
     /// Apply reranking to the top results using the cross-encoder.
+    ///
+    /// Instead of sending full document bodies, extracts a focused snippet
+    /// around query terms (~4000 chars ≈ 1024 tokens) so the reranker sees
+    /// the most relevant portion.  After reranking, blends the reranker
+    /// score with the original RRF positional rank to avoid the reranker
+    /// completely overriding good fusion results.
     fn apply_reranking(
         &self,
         query: &str,
@@ -1279,32 +1314,56 @@ impl Store {
         limit: usize,
         ranker: &crate::rerank::RerankEngine,
     ) {
+        /// Max snippet chars for the reranker (~1024 tokens at 4 chars/token).
+        const RERANK_SNIPPET_CHARS: usize = 4000;
+
         let top_n = results.len().min(limit * 2);
         let candidates: Vec<(String, String, Option<String>)> = results[..top_n]
             .iter()
             .filter_map(|r| {
                 let body = self.get_body_by_hash(&r.doc.hash).ok()??;
-                Some((r.doc.display_path(), body, Some(r.doc.title.clone())))
+                // Extract the most relevant snippet instead of full body.
+                let snippet =
+                    search::extract_snippet(&body, query, RERANK_SNIPPET_CHARS, r.chunk_pos);
+                Some((
+                    r.doc.display_path(),
+                    snippet.text,
+                    Some(r.doc.title.clone()),
+                ))
             })
             .collect();
 
-        if !candidates.is_empty()
-            && let Ok(scored) = ranker.rerank(query, &candidates)
-        {
-            let mut ranked_output: Vec<SearchResult> = Vec::with_capacity(scored.len());
-            for s in &scored {
-                if let Some(pos) = results.iter().position(|r| r.doc.display_path() == s.key) {
-                    let mut r = results.swap_remove(pos);
-                    r.score = f64::from(s.score);
-                    ranked_output.push(r);
-                }
-            }
-            ranked_output.append(results);
-            *results = ranked_output;
+        if candidates.is_empty() {
+            return;
         }
+        let Ok(scored) = ranker.rerank(query, &candidates) else {
+            return;
+        };
+
+        // Position-aware score blending: merge reranker score with RRF rank.
+        let mut ranked_output: Vec<SearchResult> = Vec::with_capacity(scored.len());
+        for s in &scored {
+            if let Some(pos) = results.iter().position(|r| r.doc.display_path() == s.key) {
+                let mut r = results.swap_remove(pos);
+                let rrf_score = r.score;
+                let rerank_score = f64::from(s.score);
+                // Blend weight based on original RRF rank position.
+                let blend = match pos {
+                    0..=2 => 0.75,
+                    3..=9 => 0.60,
+                    _ => 0.40,
+                };
+                r.score = blend * rerank_score + (1.0 - blend) * rrf_score;
+                ranked_output.push(r);
+            }
+        }
+        // Re-sort by blended score.
+        ranked_output.sort_by(|a, b| b.score.total_cmp(&a.score));
+        ranked_output.append(results);
+        *results = ranked_output;
     }
 
-    /// Structured hybrid search pipeline.
+    /// Structured hybrid search with automatic LLM query expansion.
     ///
     /// 1. Run initial FTS with the raw query.
     /// 2. If a [`GenerationEngine`](crate::generate::GenerationEngine) is
@@ -1331,64 +1390,109 @@ impl Store {
     ) -> Result<Vec<SearchResult>> {
         let fetch_limit = limit * 3;
 
-        // --- 1. Initial FTS probe ---
         let initial_fts = self
             .search_fts(query, fetch_limit, collection)
             .ok()
             .unwrap_or_default();
         let fts_scores: Vec<f64> = initial_fts.iter().map(|r| r.score).collect();
-
-        // --- 2. Query expansion (skip if strong signal) ---
         let queries = self.expand_queries(query, &fts_scores, generator);
 
-        // --- 3. Execute sub-queries, build ranked key lists ---
+        Ok(self.execute_search_pipeline(
+            query,
+            &queries,
+            initial_fts,
+            limit,
+            collection,
+            embed,
+            reranker,
+        ))
+    }
+
+    /// Search with pre-expanded queries, skipping LLM expansion.
+    ///
+    /// Use this when the caller (e.g. an MCP tool or external LLM) has
+    /// already generated query variations.  Accepts a raw query for the
+    /// initial FTS probe plus a list of typed sub-queries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any database query or embedding operation fails.
+    pub fn search_with_queries(
+        &self,
+        query: &str,
+        queries: &[search::Query],
+        limit: usize,
+        collection: Option<&str>,
+        embed: &mut crate::embed::EmbeddingEngine,
+        reranker: Option<&crate::rerank::RerankEngine>,
+    ) -> Result<Vec<SearchResult>> {
+        let fetch_limit = limit * 3;
+        let initial_fts = self
+            .search_fts(query, fetch_limit, collection)
+            .ok()
+            .unwrap_or_default();
+
+        Ok(self.execute_search_pipeline(
+            query,
+            queries,
+            initial_fts,
+            limit,
+            collection,
+            embed,
+            reranker,
+        ))
+    }
+
+    /// Shared search pipeline: FTS + sub-queries → RRF → rerank.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_search_pipeline(
+        &self,
+        query: &str,
+        queries: &[search::Query],
+        initial_fts: Vec<SearchResult>,
+        limit: usize,
+        collection: Option<&str>,
+        embed: &mut crate::embed::EmbeddingEngine,
+        reranker: Option<&crate::rerank::RerankEngine>,
+    ) -> Vec<SearchResult> {
+        let fetch_limit = limit * 3;
+
         let mut all_lists: Vec<Vec<String>> = Vec::new();
         let mut all_weights: Vec<f64> = Vec::new();
         let mut result_map: HashMap<String, SearchResult> = HashMap::new();
 
-        let fts_keys: Vec<String> = initial_fts.iter().map(|r| r.doc.display_path()).collect();
-        for r in initial_fts {
-            result_map.entry(r.doc.display_path()).or_insert(r);
-        }
-        if !fts_keys.is_empty() {
-            all_lists.push(fts_keys);
-            all_weights.push(1.0);
-        }
+        // Helper: collect search results into the shared map and ranked list.
+        let mut collect = |results: Vec<SearchResult>, weight: f64| {
+            let keys: Vec<String> = results.iter().map(|r| r.doc.display_path()).collect();
+            for r in results {
+                result_map.entry(r.doc.display_path()).or_insert(r);
+            }
+            if !keys.is_empty() {
+                all_lists.push(keys);
+                all_weights.push(weight);
+            }
+        };
 
-        for q in &queries {
+        collect(initial_fts, 1.0);
+
+        for q in queries {
             match q.kind {
                 search::QueryType::Lex => {
-                    if let Ok(results) = self.search_fts(&q.text, fetch_limit, collection) {
-                        let keys: Vec<String> =
-                            results.iter().map(|r| r.doc.display_path()).collect();
-                        for r in results {
-                            result_map.entry(r.doc.display_path()).or_insert(r);
-                        }
-                        if !keys.is_empty() {
-                            all_lists.push(keys);
-                            all_weights.push(0.8);
-                        }
+                    if let Ok(hits) = self.search_fts(&q.text, fetch_limit, collection) {
+                        collect(hits, 0.8);
                     }
                 }
                 search::QueryType::Vec | search::QueryType::Hyde => {
                     if let Ok(emb) = embed.embed_query(&q.text)
-                        && let Ok(results) = self.search_vec(&emb, fetch_limit, collection)
+                        && let Ok(hits) = self.search_vec(&emb, fetch_limit, collection)
                     {
-                        let keys: Vec<String> =
-                            results.iter().map(|r| r.doc.display_path()).collect();
-                        for r in results {
-                            result_map.entry(r.doc.display_path()).or_insert(r);
-                        }
-                        if !keys.is_empty() {
-                            all_lists.push(keys);
-                            all_weights.push(1.0);
-                        }
+                        collect(hits, 1.0);
                     }
                 }
             }
         }
 
-        // --- 4. RRF fusion ---
+        // RRF fusion.
         let list_refs: Vec<&[String]> = all_lists.iter().map(Vec::as_slice).collect();
         let fused = search::rrf(&list_refs, Some(&all_weights), 60);
 
@@ -1402,13 +1506,13 @@ impl Store {
             })
             .collect();
 
-        // --- 5. Optional reranking ---
+        // Optional reranking.
         if let Some(ranker) = reranker {
             self.apply_reranking(query, &mut results, limit, ranker);
         }
 
         results.truncate(limit);
         self.attach_context(&mut results);
-        Ok(results)
+        results
     }
 }

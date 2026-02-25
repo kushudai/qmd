@@ -317,7 +317,7 @@ fn find_best_cutoff(
         .max_by(|a, b| {
             let sa = weighted_score(a, target, window);
             let sb = weighted_score(b, target, window);
-            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            sa.total_cmp(&sb)
         })
         .map(|bp| bp.pos)
 }

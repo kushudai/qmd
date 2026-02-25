@@ -227,21 +227,34 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
     Some(result)
 }
 
-/// Minimum BM25 score to consider a "strong signal" — high enough that
-/// LLM query expansion can be skipped for latency savings.
-pub const STRONG_SIGNAL_THRESHOLD: f64 = 12.0;
+/// Normalized BM25 score above which the top result is considered strong.
+const STRONG_TOP_THRESHOLD: f64 = 0.85;
 
-/// Minimum number of strong-signal results before skipping expansion.
-pub const STRONG_SIGNAL_MIN_RESULTS: usize = 3;
+/// Minimum gap between top score and the 5th score for a clear signal.
+const STRONG_GAP_THRESHOLD: f64 = 0.15;
+
+/// Monotonic mapping of raw BM25 scores to `[0, 1)`: `x / (1 + x)`.
+///
+/// Assumes `score` is already non-negative (negated from `SQLite`'s BM25).
+#[must_use]
+pub fn normalize_bm25(score: f64) -> f64 {
+    let s = score.abs();
+    s / (1.0 + s)
+}
 
 /// Check whether FTS results are strong enough to skip LLM expansion.
+///
+/// Returns `true` when the top normalized score is high *and* there is
+/// a clear gap between the top and 5th-ranked score, indicating BM25
+/// alone found highly relevant results.
 #[must_use]
 pub fn has_strong_signal(fts_scores: &[f64]) -> bool {
-    fts_scores
-        .iter()
-        .filter(|&&s| s >= STRONG_SIGNAL_THRESHOLD)
-        .count()
-        >= STRONG_SIGNAL_MIN_RESULTS
+    if fts_scores.len() < 3 {
+        return false;
+    }
+    let top = fts_scores.first().copied().unwrap_or(0.0);
+    let fifth = fts_scores.get(4).copied().unwrap_or(0.0);
+    top >= STRONG_TOP_THRESHOLD && (top - fifth) >= STRONG_GAP_THRESHOLD
 }
 
 /// A fused RRF result carrying a key and merged score.
@@ -299,18 +312,8 @@ pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit
         })
         .collect();
 
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     hits
-}
-
-/// Fuse two ranked key lists with equal weights.
-#[must_use]
-pub fn hybrid_rrf(fts_keys: &[String], vec_keys: &[String], k: usize) -> Vec<RrfHit> {
-    rrf(&[fts_keys, vec_keys], Some(&[1.0, 1.0]), k)
 }
 
 /// Normalize a slice of scores to `[0, 1]` using min-max scaling.
@@ -336,6 +339,21 @@ pub struct Snippet {
     pub text: String,
     /// 1-indexed line number.
     pub line: usize,
+}
+
+impl Snippet {
+    /// Diff-style header: `@@ -line,count @@`.
+    #[must_use]
+    pub fn header(&self) -> String {
+        let count = self.text.lines().count();
+        format!("@@ -{},{count} @@", self.line)
+    }
+
+    /// Snippet text prefixed with a diff-style header.
+    #[must_use]
+    pub fn with_header(&self) -> String {
+        format!("{}\n{}", self.header(), self.text)
+    }
 }
 
 /// Extract a relevant snippet from `body` around query terms or `chunk_pos`.
@@ -376,6 +394,48 @@ pub fn extract_snippet(
         text: body[line_start..line_end].to_string(),
         line,
     }
+}
+
+/// Validate a lexical (BM25) query string.
+///
+/// Returns `None` if the query is valid, or `Some(reason)` describing
+/// why it is unsuitable for FTS search.
+#[must_use]
+pub fn validate_lex_query(query: &str) -> Option<&'static str> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Some("query is empty");
+    }
+    if trimmed.len() < 2 {
+        return Some("query too short (minimum 2 characters)");
+    }
+    // All-punctuation queries won't match anything useful.
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
+    {
+        return Some("query contains only punctuation");
+    }
+    None
+}
+
+/// Validate a semantic (vector) query string.
+///
+/// Returns `None` if the query is valid, or `Some(reason)` describing
+/// why it is unsuitable for embedding-based search.
+#[must_use]
+pub fn validate_vec_query(query: &str) -> Option<&'static str> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Some("query is empty");
+    }
+    if trimmed.len() < 3 {
+        return Some("query too short for semantic search (minimum 3 characters)");
+    }
+    if trimmed.split_whitespace().count() > 200 {
+        return Some("query too long (maximum 200 words)");
+    }
+    None
 }
 
 /// Add line numbers to text content (1-indexed).

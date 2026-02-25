@@ -50,6 +50,40 @@ pub fn build_virtual(collection: &str, path: &str) -> String {
     format!("qmd://{collection}/{path}")
 }
 
+/// Convert an absolute filesystem path to a virtual `qmd://` path.
+///
+/// Looks up all collections to find one whose base directory is an
+/// ancestor of `abs_path`, then builds `qmd://collection/relative`.
+/// Returns `None` if no collection matches.
+#[must_use]
+pub fn to_virtual(
+    abs_path: &Path,
+    collections: &std::collections::BTreeMap<String, crate::collections::Collection>,
+) -> Option<String> {
+    for (name, coll) in collections {
+        let base = Path::new(&coll.path);
+        if let Ok(rel) = abs_path.strip_prefix(base) {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            return Some(build_virtual(name, &rel_str));
+        }
+    }
+    None
+}
+
+/// Resolve a virtual `qmd://collection/path` to an absolute filesystem path.
+///
+/// Looks up the collection's base directory and joins the relative path.
+/// Returns `None` if the virtual path is invalid or the collection is unknown.
+#[must_use]
+pub fn resolve_virtual(
+    virtual_path: &str,
+    collections: &std::collections::BTreeMap<String, crate::collections::Collection>,
+) -> Option<std::path::PathBuf> {
+    let (collection, rel) = parse_virtual(virtual_path)?;
+    let coll = collections.get(&collection)?;
+    Some(Path::new(&coll.path).join(rel))
+}
+
 /// Check if a string looks like a docid (`#` prefix + 6 hex chars).
 #[must_use]
 pub fn is_docid(s: &str) -> bool {
