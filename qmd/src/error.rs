@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// SQLite / rusqlite error.
+    /// `SQLite` / rusqlite error.
     #[error("database: {0}")]
     Database(#[from] rusqlite::Error),
 

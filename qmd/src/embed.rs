@@ -32,6 +32,10 @@ impl std::fmt::Debug for EmbeddingEngine {
 
 impl EmbeddingEngine {
     /// Load a model from a file path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GGUF model cannot be loaded.
     pub fn new(path: &Path) -> Result<Self> {
         let loaded = model::load_gguf(path)?;
         Ok(Self {
@@ -42,16 +46,28 @@ impl EmbeddingEngine {
     }
 
     /// Load the default embedding model from cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model path cannot be resolved or the model fails to load.
     pub fn load_default() -> Result<Self> {
         Self::new(&model::get_path(model::EMBED.filename)?)
     }
 
     /// Embed a document with an optional title.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tokenization or inference fails.
     pub fn embed_document(&mut self, text: &str, title: Option<&str>) -> Result<Vec<f32>> {
         self.embed_formatted(&fmt_document(text, title))
     }
 
     /// Embed a search query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tokenization or inference fails.
     pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>> {
         self.embed_formatted(&fmt_query(query))
     }

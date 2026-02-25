@@ -1,16 +1,37 @@
-//! Document chunking for embedding pipelines.
+//! Smart document chunking for embedding pipelines.
 //!
-//! Provides [`Chunker`] for splitting documents into overlapping chunks
-//! suitable for vector embedding, using token-aware or character-based
-//! strategies.
+//! Splits documents into overlapping chunks using scored break points,
+//! code fence protection, and distance decay — ensuring chunks never
+//! split inside fenced code blocks and preferring structural boundaries.
+//!
+//! # Algorithm
+//!
+//! 1. Pre-scan the document for all break points (headings, blank lines,
+//!    list items, sentences, etc.) and code fence ranges.
+//! 2. For each chunk boundary, find the best break point within a search
+//!    window using a score × proximity formula.
+//! 3. Reject any break point that falls inside a fenced code block.
+//!
+//! # Examples
+//!
+//! ```rust,no_run
+//! use qmd::chunk::Chunker;
+//!
+//! let chunks = Chunker::default().split_chars("some long document...");
+//! // or with a tokenizer:
+//! // let chunks = Chunker::default().split(&engine, "some long document...")?;
+//! ```
 
 use crate::error::Result;
 
 /// Default chunk size in tokens.
 pub const DEFAULT_CHUNK_TOKENS: usize = 800;
 
-/// Default overlap in tokens (~15% of chunk size).
+/// Default overlap in tokens (~15 % of chunk size).
 pub const DEFAULT_OVERLAP_TOKENS: usize = DEFAULT_CHUNK_TOKENS * 15 / 100;
+
+/// Chars-per-token estimate (prose ≈ 4, code ≈ 2, mixed ≈ 3).
+const CHARS_PER_TOKEN: usize = 4;
 
 /// A text chunk produced by [`Chunker`].
 #[derive(Debug, Clone)]
@@ -27,22 +48,14 @@ pub struct Chunk {
 /// Trait for token counting, decoupling chunking from a specific model.
 pub trait Tokenizer {
     /// Count tokens in `text`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tokenizer fails to process the input.
     fn count_tokens(&self, text: &str) -> Result<usize>;
 }
 
 /// Configurable document chunker.
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// use qmd::chunk::Chunker;
-///
-/// // Character-based (no tokenizer needed)
-/// let chunks = Chunker::default().split_chars("some long document...");
-///
-/// // Token-aware (requires a Tokenizer implementation)
-/// // let chunks = Chunker::default().split(&engine, "some long document...")?;
-/// ```
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct Chunker {
@@ -73,7 +86,13 @@ impl Chunker {
 
     /// Split a document into token-aware chunks.
     ///
-    /// Keeps paragraphs intact when possible.
+    /// Uses the same scored-break-point algorithm as [`split_chars`](Self::split_chars),
+    /// but verifies each chunk against the tokenizer and re-splits oversized
+    /// chunks with a tighter character budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tokenizer fails to count tokens.
     pub fn split(&self, tok: &impl Tokenizer, content: &str) -> Result<Vec<Chunk>> {
         let total = tok.count_tokens(content)?;
         if total <= self.max_tokens {
@@ -84,59 +103,51 @@ impl Chunker {
             }]);
         }
 
-        let paragraphs: Vec<&str> = content.split("\n\n").collect();
-        let mut chunks = Vec::new();
-        let mut cur_text = String::new();
-        let mut cur_tokens = 0usize;
-        let mut chunk_start = 0usize;
-        let mut char_pos = 0usize;
+        // First pass: character-based smart chunking.
+        let char_chunks = self.split_chars(content);
 
-        for (i, para) in paragraphs.iter().enumerate() {
-            let para_tokens = tok.count_tokens(para)?;
-            let sep_tokens = if i > 0 { 2 } else { 0 };
-            let para_with_sep = if i > 0 {
-                format!("\n\n{para}")
-            } else {
-                (*para).to_string()
-            };
-
-            if cur_tokens + para_tokens + sep_tokens > self.max_tokens && !cur_text.is_empty() {
-                chunks.push(Chunk {
-                    text: cur_text.clone(),
-                    pos: chunk_start,
-                    token_count: Some(cur_tokens),
+        // Second pass: verify token counts, re-split oversized chunks.
+        let mut result = Vec::with_capacity(char_chunks.len());
+        for chunk in char_chunks {
+            let tokens = tok.count_tokens(&chunk.text)?;
+            if tokens <= self.max_tokens {
+                result.push(Chunk {
+                    token_count: Some(tokens),
+                    ..chunk
                 });
-
-                let overlap = tail_overlap(&cur_text, self.overlap_tokens, tok)?;
-                cur_text = overlap;
-                cur_tokens = tok.count_tokens(&cur_text)?;
-                chunk_start = char_pos.saturating_sub(cur_text.len());
+            } else {
+                // Re-split with tighter budget based on actual chars/token ratio.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let safe_chars = {
+                    let ratio = chunk.text.len() as f64 / tokens as f64;
+                    (self.max_tokens as f64 * ratio * 0.95) as usize
+                };
+                let sub = Self::new(safe_chars / CHARS_PER_TOKEN, self.overlap_tokens / 2);
+                for sc in sub.split_chars(&chunk.text) {
+                    let t = tok.count_tokens(&sc.text)?;
+                    result.push(Chunk {
+                        text: sc.text,
+                        pos: chunk.pos + sc.pos,
+                        token_count: Some(t),
+                    });
+                }
             }
-
-            if !cur_text.is_empty() {
-                cur_text.push_str("\n\n");
-            }
-            cur_text.push_str(para);
-            cur_tokens += para_tokens + sep_tokens;
-            char_pos += para_with_sep.len();
         }
-
-        if !cur_text.is_empty() {
-            chunks.push(Chunk {
-                text: cur_text.clone(),
-                pos: chunk_start,
-                token_count: Some(cur_tokens),
-            });
-        }
-
-        Ok(chunks)
+        Ok(result)
     }
 
-    /// Split a document using character-based heuristics (no tokenizer needed).
+    /// Split a document using smart character-based heuristics.
+    ///
+    /// Uses scored break points with code fence protection.
     #[must_use]
     pub fn split_chars(&self, content: &str) -> Vec<Chunk> {
-        let max_chars = self.max_tokens * 4;
-        let overlap_chars = self.overlap_tokens * 4;
+        let max_chars = self.max_tokens * CHARS_PER_TOKEN;
+        let overlap_chars = self.overlap_tokens * CHARS_PER_TOKEN;
+        let window_chars = self.max_tokens; // ~25 % of max_chars
 
         if content.len() <= max_chars {
             return vec![Chunk {
@@ -146,85 +157,179 @@ impl Chunker {
             }];
         }
 
+        // Pre-scan once for the whole document.
+        let breaks = scan_break_points(content);
+        let fences = scan_code_fences(content);
+
         let mut chunks = Vec::new();
         let mut pos = 0;
 
         while pos < content.len() {
-            let end = (pos + max_chars).min(content.len());
-            let mut actual_end = if end < content.len() {
-                find_break_point(content, pos, end)
-            } else {
-                end
-            };
-            if actual_end <= pos {
-                actual_end = (pos + max_chars).min(content.len());
+            let target_end = (pos + max_chars).min(content.len());
+            let mut end = target_end;
+
+            // Find best scored break point (only if not at document end).
+            if end < content.len()
+                && let Some(bp) = find_best_cutoff(&breaks, target_end, window_chars, &fences)
+                && bp > pos
+                && bp <= target_end
+            {
+                end = bp;
+            }
+
+            // Guarantee forward progress.
+            if end <= pos {
+                end = (pos + max_chars).min(content.len());
             }
 
             chunks.push(Chunk {
-                text: content[pos..actual_end].to_string(),
+                text: content[pos..end].to_string(),
                 pos,
                 token_count: None,
             });
 
-            if actual_end >= content.len() {
+            if end >= content.len() {
                 break;
             }
 
-            pos = actual_end.saturating_sub(overlap_chars);
-            if chunks.last().is_some_and(|last| pos <= last.pos) {
-                pos = actual_end;
-            }
+            // Advance with overlap.
+            let next = end.saturating_sub(overlap_chars);
+            pos = if chunks.last().is_some_and(|c| next <= c.pos) {
+                end // prevent infinite loop
+            } else {
+                next
+            };
         }
 
         chunks
     }
 }
 
-/// Extract overlap text from the tail of a chunk.
-fn tail_overlap(text: &str, target_tokens: usize, tok: &impl Tokenizer) -> Result<String> {
-    let start = text.len() * 4 / 5;
-    let candidate = &text[start..];
-
-    if let Some(pos) = candidate.find("\n\n") {
-        let overlap = &candidate[pos + 2..];
-        if tok.count_tokens(overlap)? <= target_tokens * 2 {
-            return Ok(overlap.to_string());
-        }
-    }
-
-    let words: Vec<&str> = candidate.split_whitespace().collect();
-    let mut result = String::new();
-    for word in words.iter().rev().take(target_tokens / 2) {
-        if result.is_empty() {
-            result = (*word).to_string();
-        } else {
-            result = format!("{word} {result}");
-        }
-    }
-
-    Ok(result)
+/// A scored position where the document *may* be cut.
+#[derive(Debug, Clone, Copy)]
+struct BreakPoint {
+    /// Byte offset in the document (cut happens *before* this position).
+    pos: usize,
+    /// Base score — higher means better cut point.
+    score: u32,
 }
 
-/// Find a good break point (paragraph > sentence > line > word).
-fn find_break_point(content: &str, start: usize, end: usize) -> usize {
-    let slice = &content[start..end];
-    let search_start = slice.len() * 7 / 10;
-    let tail = &slice[search_start..];
+/// Ranked break-point patterns (descending importance).
+const PATTERNS: &[(&str, u32)] = &[
+    ("\n# ", 100),   // H1
+    ("\n## ", 90),   // H2
+    ("\n### ", 85),  // H3
+    ("\n#### ", 80), // H4
+    ("\n```", 75),   // Code fence boundary
+    ("\n---", 70),   // Horizontal rule / front-matter
+    ("\n\n", 60),    // Blank line (paragraph break)
+    ("\n- ", 45),    // Unordered list item
+    ("\n* ", 45),    // Unordered list item (alt)
+    ("\n1. ", 45),   // Ordered list item
+    (". ", 30),      // Sentence end
+    (".\n", 30),     // Sentence end at EOL
+    ("? ", 25),      // Question
+    ("! ", 25),      // Exclamation
+    ("\n", 10),      // Any line break
+];
 
-    if let Some(pos) = tail.rfind("\n\n") {
-        return start + search_start + pos + 2;
-    }
-    for pat in &[". ", ".\n", "? ", "?\n", "! ", "!\n"] {
-        if let Some(pos) = tail.rfind(pat) {
-            return start + search_start + pos + 2;
+/// Scan the entire document for break points, returning them sorted by position.
+fn scan_break_points(content: &str) -> Vec<BreakPoint> {
+    let mut points = Vec::new();
+    for &(pat, score) in PATTERNS {
+        let mut start = 0;
+        while let Some(idx) = content[start..].find(pat) {
+            let abs = start + idx;
+            // Cut position is right after the pattern for line-oriented patterns,
+            // or at the pattern start for inline sentence breaks.
+            let cut = if pat.starts_with('\n') {
+                abs + 1 // cut at the start of the new structural element
+            } else {
+                abs + pat.len() // cut after ". " etc.
+            };
+            if cut > 0 && cut < content.len() {
+                points.push(BreakPoint { pos: cut, score });
+            }
+            start = abs + pat.len().max(1);
         }
     }
-    if let Some(pos) = tail.rfind('\n') {
-        return start + search_start + pos + 1;
-    }
-    if let Some(pos) = tail.rfind(' ') {
-        return start + search_start + pos + 1;
-    }
+    points.sort_by_key(|bp| bp.pos);
+    points.dedup_by_key(|bp| bp.pos);
+    points
+}
 
-    end
+/// A byte range [start, end) inside a fenced code block.
+#[derive(Debug, Clone, Copy)]
+struct FenceRange {
+    /// Start of the opening fence line.
+    start: usize,
+    /// End of the closing fence line (exclusive).
+    end: usize,
+}
+
+/// Scan for fenced code blocks (triple-backtick or triple-tilde).
+fn scan_code_fences(content: &str) -> Vec<FenceRange> {
+    let mut ranges = Vec::new();
+    let mut open: Option<usize> = None;
+
+    for (idx, line) in content.split('\n').scan(0usize, |pos, line| {
+        let start = *pos;
+        *pos += line.len() + 1; // +1 for the '\n'
+        Some((start, line))
+    }) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if let Some(start) = open {
+                ranges.push(FenceRange {
+                    start,
+                    end: idx + line.len(),
+                });
+                open = None;
+            } else {
+                open = Some(idx);
+            }
+        }
+    }
+    ranges
+}
+
+/// Check if a position falls inside any fenced code block.
+fn inside_fence(pos: usize, fences: &[FenceRange]) -> bool {
+    fences.iter().any(|f| pos > f.start && pos < f.end)
+}
+
+/// Find the best break point near `target` within `±window` chars.
+///
+/// Uses `score × proximity` ranking and rejects points inside code fences.
+fn find_best_cutoff(
+    breaks: &[BreakPoint],
+    target: usize,
+    window: usize,
+    fences: &[FenceRange],
+) -> Option<usize> {
+    let lo = target.saturating_sub(window);
+    let hi = target + window / 4; // asymmetric: prefer cutting early
+
+    breaks
+        .iter()
+        .filter(|bp| bp.pos >= lo && bp.pos <= hi)
+        .filter(|bp| !inside_fence(bp.pos, fences))
+        .max_by(|a, b| {
+            let sa = weighted_score(a, target, window);
+            let sb = weighted_score(b, target, window);
+            sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|bp| bp.pos)
+}
+
+/// Score a break point factoring in distance decay from `target`.
+///
+/// `weighted = base_score × (1 - (distance / window)²)`
+#[allow(clippy::cast_precision_loss)]
+fn weighted_score(bp: &BreakPoint, target: usize, window: usize) -> f64 {
+    let dist = bp.pos.abs_diff(target) as f64;
+    let w = window as f64;
+    let ratio = dist / w;
+    let proximity = ratio.mul_add(-ratio, 1.0).max(0.0);
+    f64::from(bp.score) * proximity
 }

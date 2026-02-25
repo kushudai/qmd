@@ -76,6 +76,10 @@ impl ConfigManager {
     }
 
     /// Load config from disk. Returns empty config if absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config file cannot be read or parsed.
     pub fn load(&self) -> Result<Config> {
         let path = config::config_path(&self.index_name)?;
         if !path.exists() {
@@ -86,6 +90,10 @@ impl ConfigManager {
     }
 
     /// Persist config to disk, creating directories as needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config directory or file cannot be written.
     pub fn save(&self, cfg: &Config) -> Result<()> {
         let dir = config::config_dir()?;
         fs::create_dir_all(&dir)?;
@@ -95,16 +103,28 @@ impl ConfigManager {
     }
 
     /// Get a collection by name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded.
     pub fn get(&self, name: &str) -> Result<Option<Collection>> {
         Ok(self.load()?.collections.get(name).cloned())
     }
 
     /// List all collections as `(name, collection)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded.
     pub fn list(&self) -> Result<BTreeMap<String, Collection>> {
         Ok(self.load()?.collections)
     }
 
     /// Add or update a collection (preserves existing context).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded or saved.
     pub fn add(&self, name: &str, path: &str, pattern: &str) -> Result<()> {
         let mut cfg = self.load()?;
         let existing_ctx = cfg.collections.get(name).and_then(|c| c.context.clone());
@@ -121,6 +141,10 @@ impl ConfigManager {
     }
 
     /// Remove a collection. Returns `true` if it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded or saved.
     pub fn remove(&self, name: &str) -> Result<bool> {
         let mut cfg = self.load()?;
         let removed = cfg.collections.remove(name).is_some();
@@ -131,6 +155,10 @@ impl ConfigManager {
     }
 
     /// Rename a collection. Returns `false` if `old_name` was not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded or saved, or if `new_name` already exists.
     pub fn rename(&self, old_name: &str, new_name: &str) -> Result<bool> {
         let mut cfg = self.load()?;
         let Some(coll) = cfg.collections.remove(old_name) else {
@@ -147,11 +175,19 @@ impl ConfigManager {
     }
 
     /// Get the global context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded.
     pub fn global_context(&self) -> Result<Option<String>> {
         Ok(self.load()?.global_context)
     }
 
     /// Set (or clear) the global context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded or saved.
     pub fn set_global_context(&self, context: Option<&str>) -> Result<()> {
         let mut cfg = self.load()?;
         cfg.global_context = context.map(str::to_string);
@@ -159,6 +195,10 @@ impl ConfigManager {
     }
 
     /// Add or update a context entry. Returns `false` if collection not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded or saved.
     pub fn add_context(&self, collection: &str, prefix: &str, text: &str) -> Result<bool> {
         let mut cfg = self.load()?;
         let Some(coll) = cfg.collections.get_mut(collection) else {
@@ -172,6 +212,10 @@ impl ConfigManager {
     }
 
     /// Remove a context entry. Returns `true` if it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded or saved.
     pub fn remove_context(&self, collection: &str, prefix: &str) -> Result<bool> {
         let mut cfg = self.load()?;
         let Some(coll) = cfg.collections.get_mut(collection) else {
@@ -190,40 +234,59 @@ impl ConfigManager {
         Ok(removed)
     }
 
-    /// Find the best matching context for a file path.
+    /// Resolve context for a file path using hierarchical accumulation.
     ///
-    /// Uses longest-prefix matching. Falls back to global context.
+    /// Collects **all** matching contexts — global context first, then
+    /// path-prefix matches ordered shortest-to-longest — and joins them
+    /// with `\n\n`.  This lets more-specific contexts *add* detail rather
+    /// than *replace* general ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config cannot be loaded.
     pub fn find_context(&self, collection: &str, file_path: &str) -> Result<Option<String>> {
         let cfg = self.load()?;
+        let mut parts: Vec<String> = Vec::new();
 
-        let Some(coll) = cfg.collections.get(collection) else {
-            return Ok(cfg.global_context);
-        };
-        let Some(ref map) = coll.context else {
-            return Ok(cfg.global_context);
-        };
+        // 1. Global context (always first).
+        if let Some(ref gc) = cfg.global_context {
+            parts.push(gc.clone());
+        }
 
-        let norm = if file_path.starts_with('/') {
-            file_path.to_string()
+        // 2. All matching path-prefix contexts, shortest first.
+        if let Some(coll) = cfg.collections.get(collection)
+            && let Some(ref map) = coll.context
+        {
+            let norm = if file_path.starts_with('/') {
+                file_path.to_string()
+            } else {
+                format!("/{file_path}")
+            };
+
+            let mut matches: Vec<_> = map
+                .iter()
+                .filter(|(prefix, _)| {
+                    let p = if prefix.starts_with('/') {
+                        (*prefix).clone()
+                    } else {
+                        format!("/{prefix}")
+                    };
+                    norm.starts_with(&p)
+                })
+                .collect();
+
+            // Shortest prefix first → most general context first.
+            matches.sort_by_key(|(prefix, _)| prefix.len());
+
+            for (_, ctx) in matches {
+                parts.push(ctx.clone());
+            }
+        }
+
+        if parts.is_empty() {
+            Ok(None)
         } else {
-            format!("/{file_path}")
-        };
-
-        let best = map
-            .iter()
-            .filter(|(prefix, _)| {
-                let p = if prefix.starts_with('/') {
-                    (*prefix).clone()
-                } else {
-                    format!("/{prefix}")
-                };
-                norm.starts_with(&p)
-            })
-            .max_by_key(|(prefix, _)| prefix.len());
-
-        match best {
-            Some((_, ctx)) => Ok(Some(ctx.clone())),
-            None => Ok(cfg.global_context),
+            Ok(Some(parts.join("\n\n")))
         }
     }
 }

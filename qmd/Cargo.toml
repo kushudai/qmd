@@ -16,8 +16,10 @@ path = "src/lib.rs"
 
 [dependencies]
 dirs.workspace = true
+fastrand.workspace = true
 fuzzy-matcher.workspace = true
 glob.workspace = true
+humantime.workspace = true
 indicatif.workspace = true
 llama-cpp-2.workspace = true
 regex.workspace = true

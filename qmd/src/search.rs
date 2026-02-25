@@ -1,4 +1,5 @@
-//! Search utilities: query expansion, RRF fusion, and snippet extraction.
+//! Search utilities: query expansion, FTS5 query parsing, RRF fusion,
+//! snippet extraction, and structured search pipeline.
 
 use std::collections::HashMap;
 
@@ -12,7 +13,7 @@ pub enum QueryType {
     Lex,
     /// Vector (semantic).
     Vec,
-    /// HyDE — Hypothetical Document Embedding.
+    /// `HyDE` — Hypothetical Document Embedding.
     Hyde,
 }
 
@@ -48,7 +49,7 @@ impl Query {
         Self::new(QueryType::Vec, text)
     }
 
-    /// Create a HyDE query.
+    /// Create a `HyDE` query.
     #[must_use]
     pub fn hyde(text: impl Into<String>) -> Self {
         Self::new(QueryType::Hyde, text)
@@ -108,6 +109,141 @@ impl Query {
     }
 }
 
+/// Sanitize a single term for FTS5 (keep only letters, digits, apostrophes).
+fn sanitize_fts5_term(term: &str) -> String {
+    term.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '\'')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Build an FTS5 query from user-facing search syntax.
+///
+/// Supports:
+/// - **Quoted phrases**: `"exact phrase"` → exact match
+/// - **Negation**: `-term` or `-"phrase"` → FTS5 NOT operator
+/// - **Plain terms**: `term` → `"term"*` (prefix match)
+///
+/// Returns `None` if the query contains no usable terms.
+///
+/// # Examples
+///
+/// ```
+/// use qmd::search::build_fts5_query;
+///
+/// assert_eq!(
+///     build_fts5_query("performance -sports"),
+///     Some(r#""performance"* NOT "sports"*"#.to_string()),
+/// );
+/// assert_eq!(
+///     build_fts5_query(r#""machine learning""#),
+///     Some(r#""machine learning""#.to_string()),
+/// );
+/// ```
+#[must_use]
+pub fn build_fts5_query(query: &str) -> Option<String> {
+    let mut positive: Vec<String> = Vec::new();
+    let mut negative: Vec<String> = Vec::new();
+
+    let s = query.trim();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Skip whitespace.
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
+        // Check negation prefix.
+        let negated = bytes[i] == b'-';
+        if negated {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+        }
+
+        // Quoted phrase.
+        if bytes[i] == b'"' {
+            i += 1; // skip opening quote
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            let phrase = &s[start..i];
+            if i < bytes.len() {
+                i += 1; // skip closing quote
+            }
+            let sanitized: String = phrase
+                .split_whitespace()
+                .map(sanitize_fts5_term)
+                .filter(|w| !w.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !sanitized.is_empty() {
+                let fts = format!("\"{sanitized}\"");
+                if negated {
+                    negative.push(fts);
+                } else {
+                    positive.push(fts);
+                }
+            }
+        } else {
+            // Plain term (until whitespace or quote).
+            let start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'"' {
+                i += 1;
+            }
+            let term = &s[start..i];
+            let sanitized = sanitize_fts5_term(term);
+            if !sanitized.is_empty() {
+                let fts = format!("\"{sanitized}\"*");
+                if negated {
+                    negative.push(fts);
+                } else {
+                    positive.push(fts);
+                }
+            }
+        }
+    }
+
+    if positive.is_empty() && negative.is_empty() {
+        return None;
+    }
+
+    // If only negative terms, nothing to match against.
+    if positive.is_empty() {
+        return None;
+    }
+
+    let mut result = positive.join(" ");
+    for neg in &negative {
+        result = format!("{result} NOT {neg}");
+    }
+    Some(result)
+}
+
+/// Minimum BM25 score to consider a "strong signal" — high enough that
+/// LLM query expansion can be skipped for latency savings.
+pub const STRONG_SIGNAL_THRESHOLD: f64 = 12.0;
+
+/// Minimum number of strong-signal results before skipping expansion.
+pub const STRONG_SIGNAL_MIN_RESULTS: usize = 3;
+
+/// Check whether FTS results are strong enough to skip LLM expansion.
+#[must_use]
+pub fn has_strong_signal(fts_scores: &[f64]) -> bool {
+    fts_scores
+        .iter()
+        .filter(|&&s| s >= STRONG_SIGNAL_THRESHOLD)
+        .count()
+        >= STRONG_SIGNAL_MIN_RESULTS
+}
+
 /// A fused RRF result carrying a key and merged score.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -163,7 +299,11 @@ pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit
         })
         .collect();
 
-    hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits
 }
 
@@ -171,6 +311,21 @@ pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit
 #[must_use]
 pub fn hybrid_rrf(fts_keys: &[String], vec_keys: &[String], k: usize) -> Vec<RrfHit> {
     rrf(&[fts_keys, vec_keys], Some(&[1.0, 1.0]), k)
+}
+
+/// Normalize a slice of scores to `[0, 1]` using min-max scaling.
+#[must_use]
+pub fn normalize_scores(scores: &[f64]) -> Vec<f64> {
+    if scores.is_empty() {
+        return Vec::new();
+    }
+    let min = scores.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+    if range < f64::EPSILON {
+        return vec![1.0; scores.len()];
+    }
+    scores.iter().map(|s| (s - min) / range).collect()
 }
 
 /// An extracted snippet with its starting line number.
@@ -185,29 +340,50 @@ pub struct Snippet {
 
 /// Extract a relevant snippet from `body` around query terms or `chunk_pos`.
 #[must_use]
-pub fn extract_snippet(body: &str, query: &str, max_chars: usize, chunk_pos: Option<usize>) -> Snippet {
+pub fn extract_snippet(
+    body: &str,
+    query: &str,
+    max_chars: usize,
+    chunk_pos: Option<usize>,
+) -> Snippet {
     if body.len() <= max_chars {
-        return Snippet { text: body.to_string(), line: 1 };
+        return Snippet {
+            text: body.to_string(),
+            line: 1,
+        };
     }
 
     let body_lower = body.to_lowercase();
-    let start_pos = if let Some(pos) = chunk_pos {
-        pos.min(body.len().saturating_sub(max_chars))
-    } else {
-        query
-            .split_whitespace()
-            .filter(|t| t.len() >= 3)
-            .find_map(|t| body_lower.find(&t.to_lowercase()))
-            .map_or(0, |p| p.saturating_sub(50))
-    };
+    let start_pos = chunk_pos.map_or_else(
+        || {
+            query
+                .split_whitespace()
+                .filter(|t| t.len() >= 3)
+                .find_map(|t| body_lower.find(&t.to_lowercase()))
+                .map_or(0, |p| p.saturating_sub(50))
+        },
+        |pos| pos.min(body.len().saturating_sub(max_chars)),
+    );
 
     let line_start = body[..start_pos].rfind('\n').map_or(0, |p| p + 1);
     let end_pos = (line_start + max_chars).min(body.len());
-    let line_end = body[end_pos..].find('\n').map_or(body.len(), |p| end_pos + p);
+    let line_end = body[end_pos..]
+        .find('\n')
+        .map_or(body.len(), |p| end_pos + p);
     let line = body[..line_start].matches('\n').count() + 1;
 
     Snippet {
         text: body[line_start..line_end].to_string(),
         line,
     }
+}
+
+/// Add line numbers to text content (1-indexed).
+#[must_use]
+pub fn add_line_numbers(text: &str, start_line: usize) -> String {
+    text.lines()
+        .enumerate()
+        .map(|(i, line)| format!("{}: {line}", start_line + i))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

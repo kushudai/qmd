@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 pub struct ModelSpec {
     /// Local cache filename.
     pub filename: &'static str,
-    /// HuggingFace download URI (`hf:user/repo/file`).
+    /// `HuggingFace` download URI (`hf:user/repo/file`).
     pub uri: &'static str,
 }
 
@@ -38,6 +38,10 @@ pub const GENERATE: ModelSpec = ModelSpec {
 };
 
 /// Local path of a cached model. Errors if not found.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved or the model is not found.
 pub fn get_path(name: &str) -> Result<PathBuf> {
     let path = config::model_cache_dir()?.join(name);
     if !path.exists() {
@@ -47,11 +51,19 @@ pub fn get_path(name: &str) -> Result<PathBuf> {
 }
 
 /// Whether a model is cached locally.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved.
 pub fn exists(name: &str) -> Result<bool> {
     Ok(config::model_cache_dir()?.join(name).exists())
 }
 
 /// List cached `.gguf` model filenames.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be resolved.
 pub fn list_cached() -> Result<Vec<String>> {
     let dir = config::model_cache_dir()?;
     if !dir.exists() {
@@ -71,6 +83,10 @@ pub fn list_cached() -> Result<Vec<String>> {
 /// Download or verify a model. Returns `(local_path, freshly_downloaded)`.
 ///
 /// Supports `hf:user/repo/file.gguf` URIs and plain filenames.
+///
+/// # Errors
+///
+/// Returns an error if the download fails or the URI is invalid.
 pub fn pull(uri: &str, refresh: bool) -> Result<(PathBuf, bool)> {
     let cache_dir = config::model_cache_dir()?;
     fs::create_dir_all(&cache_dir)?;
@@ -102,6 +118,10 @@ pub fn pull(uri: &str, refresh: bool) -> Result<(PathBuf, bool)> {
 }
 
 /// Resolve a model URI to a local path, downloading if needed.
+///
+/// # Errors
+///
+/// Returns an error if the model cannot be downloaded or resolved.
 pub fn resolve(uri: &str) -> Result<PathBuf> {
     let (path, _) = pull(uri, false)?;
     Ok(path)
@@ -118,6 +138,10 @@ pub struct LoadedModel {
 }
 
 /// Load a GGUF model from disk.
+///
+/// # Errors
+///
+/// Returns an error if the backend fails to initialize or the model cannot be loaded.
 pub fn load_gguf(path: &Path) -> Result<LoadedModel> {
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::model::LlamaModel;
@@ -133,7 +157,7 @@ pub fn load_gguf(path: &Path) -> Result<LoadedModel> {
     })
 }
 
-/// Parsed HuggingFace model reference.
+/// Parsed `HuggingFace` model reference.
 #[derive(Debug, Clone)]
 struct HfRef {
     /// Repository in `user/repo` format.
@@ -155,12 +179,15 @@ fn parse_hf_uri(uri: &str) -> Option<HfRef> {
     })
 }
 
-/// Build the HuggingFace download URL.
+/// Build the `HuggingFace` download URL.
 fn hf_url(hf: &HfRef) -> String {
-    format!("https://huggingface.co/{}/resolve/main/{}", hf.repo, hf.file)
+    format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        hf.repo, hf.file
+    )
 }
 
-/// Fetch remote ETag for cache validation.
+/// Fetch remote `ETag` for cache validation.
 fn remote_etag(hf: &HfRef) -> Option<String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(10))

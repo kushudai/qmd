@@ -3,8 +3,10 @@
 //! This module provides all database operations, search functions, and document
 //! retrieval for QMD.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -13,6 +15,12 @@ use crate::collections::ConfigManager;
 use crate::config;
 use crate::document::{Document, SearchResult, SearchSource};
 use crate::error::{Error, Result};
+use crate::search;
+
+/// RFC 3339 UTC timestamp from system clock.
+fn now_rfc3339() -> String {
+    humantime::format_rfc3339_seconds(SystemTime::now()).to_string()
+}
 
 /// Collection info from database.
 #[derive(Debug, Clone)]
@@ -121,11 +129,19 @@ pub struct Store {
 
 impl Store {
     /// Create a new store with the default index name (`"index"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be created or initialized.
     pub fn new() -> Result<Self> {
         Self::with_index("index")
     }
 
     /// Create a store for a named index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database path cannot be resolved or the store cannot be opened.
     pub fn with_index(index_name: &str) -> Result<Self> {
         let db_path = config::db_path(index_name)?;
         Self::open(&db_path, ConfigManager::new(index_name))
@@ -135,11 +151,19 @@ impl Store {
     ///
     /// Convenient for examples and tests. For production use, prefer
     /// [`Store::open`] with an explicit [`ConfigManager`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or initialized.
     pub fn open_path(db_path: &Path) -> Result<Self> {
         Self::open(db_path, ConfigManager::default())
     }
 
     /// Open a store at an explicit database path with a specific config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or the schema cannot be initialized.
     pub fn open(db_path: &Path, config: ConfigManager) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             fs::create_dir_all(parent)?;
@@ -287,19 +311,83 @@ impl Store {
         format!("{:x}", hasher.finalize())
     }
 
-    /// Extract the first heading from markdown content as a title.
+    /// Extract a title from document content.
+    ///
+    /// Supports markdown (`# Heading`, `## Heading`) and Org-mode
+    /// (`#+TITLE:`, `* Heading`).  Falls back to a cleaned-up `filename`
+    /// (extension stripped, last path component).
     #[must_use]
-    pub fn extract_title(content: &str) -> String {
+    pub fn extract_title(content: &str, filename: &str) -> String {
+        let ext = filename
+            .rfind('.')
+            .map_or("", |i| &filename[i..])
+            .to_ascii_lowercase();
+
+        let title = match ext.as_str() {
+            ".org" => Self::title_from_org(content),
+            _ => Self::title_from_markdown(content),
+        };
+
+        if let Some(t) = title {
+            return t;
+        }
+
+        // Fallback: derive title from filename.
+        filename
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(filename)
+            .rfind('.')
+            .map_or_else(
+                || filename.to_string(),
+                |i| filename.rsplit(['/', '\\']).next().unwrap_or(filename)[..i].to_string(),
+            )
+    }
+
+    /// Extract title from markdown content (H1 or H2).
+    fn title_from_markdown(content: &str) -> Option<String> {
         for line in content.lines() {
             let trimmed = line.trim();
             if let Some(rest) = trimmed.strip_prefix("# ") {
-                return rest.trim().to_string();
+                let t = rest.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
             }
             if let Some(rest) = trimmed.strip_prefix("## ") {
-                return rest.trim().to_string();
+                let t = rest.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
             }
         }
-        String::new()
+        None
+    }
+
+    /// Extract title from Org-mode content (`#+TITLE:` or first heading).
+    fn title_from_org(content: &str) -> Option<String> {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed
+                .strip_prefix("#+TITLE:")
+                .or_else(|| trimmed.strip_prefix("#+title:"))
+            {
+                let t = rest.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+        // Fallback to first org heading.
+        for line in content.lines() {
+            if let Some(rest) = line.trim().strip_prefix("* ") {
+                let t = rest.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+        None
     }
 
     /// Attach folder context descriptions to search results.
@@ -313,6 +401,10 @@ impl Store {
     }
 
     /// Insert content into content-addressable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
     pub fn insert_content(&self, hash: &str, content: &str, created_at: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?1, ?2, ?3)",
@@ -322,6 +414,10 @@ impl Store {
     }
 
     /// Insert a document record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
     pub fn insert_document(
         &self,
         collection: &str,
@@ -347,11 +443,11 @@ impl Store {
     }
 
     /// Find an active document by collection and path.
-    pub fn find_active_document(
-        &self,
-        collection: &str,
-        path: &str,
-    ) -> Result<Option<ActiveDoc>> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn find_active_document(&self, collection: &str, path: &str) -> Result<Option<ActiveDoc>> {
         let result = self
             .conn
             .query_row(
@@ -370,6 +466,10 @@ impl Store {
     }
 
     /// Update document hash, title, and timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
     pub fn update_document(
         &self,
         document_id: i64,
@@ -385,6 +485,10 @@ impl Store {
     }
 
     /// Deactivate a document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
     pub fn deactivate_document(&self, collection: &str, path: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE documents SET active = 0 WHERE collection = ?1 AND path = ?2",
@@ -394,6 +498,10 @@ impl Store {
     }
 
     /// Get all active document paths for a collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn get_active_document_paths(&self, collection: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
@@ -405,12 +513,21 @@ impl Store {
     }
 
     /// Full-text search using FTS5.
+    ///
+    /// The `query` is parsed through [`search::build_fts5_query`] which
+    /// supports quoted phrases, negation (`-term`), and prefix matching.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the FTS query execution fails.
     pub fn search_fts(
         &self,
         query: &str,
         limit: usize,
         collection: Option<&str>,
     ) -> Result<Vec<SearchResult>> {
+        let fts_query = search::build_fts5_query(query).unwrap_or_else(|| query.to_string());
+
         let coll_filter = if collection.is_some() {
             "AND d.collection = ?2"
         } else {
@@ -450,10 +567,10 @@ impl Store {
         };
 
         let mut results: Vec<SearchResult> = if let Some(coll) = collection {
-            stmt.query_map(params![query, coll, limit as i64], map_row)?
+            stmt.query_map(params![&fts_query, coll, limit as i64], map_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         } else {
-            stmt.query_map(params![query, limit as i64], map_row)?
+            stmt.query_map(params![&fts_query, limit as i64], map_row)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
 
@@ -462,6 +579,10 @@ impl Store {
     }
 
     /// Get document by collection and path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn get_document(&self, collection: &str, path: &str) -> Result<Option<Document>> {
         let result = self
             .conn
@@ -498,6 +619,10 @@ impl Store {
     }
 
     /// Get document by docid (first 6 chars of hash).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn find_document_by_docid(&self, docid: &str) -> Result<Option<(String, String)>> {
         let clean_docid = docid.trim_start_matches('#');
         let result = self
@@ -517,6 +642,10 @@ impl Store {
     }
 
     /// List collections with stats from database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config or database cannot be read.
     pub fn list_collections(&self) -> Result<Vec<CollectionInfo>> {
         let yaml_collections = self.config.list()?;
 
@@ -549,6 +678,10 @@ impl Store {
     }
 
     /// Unified index statistics and health diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database queries fail.
     pub fn stats(&self) -> Result<IndexStats> {
         let total_docs = self.conn.query_row(
             "SELECT COUNT(*) FROM documents WHERE active = 1",
@@ -598,6 +731,10 @@ impl Store {
     }
 
     /// Remove a collection and its documents from the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operations fail.
     pub fn remove_collection_documents(&self, name: &str) -> Result<(usize, usize)> {
         // Get count before deletion.
         let doc_count = self.conn.query_row(
@@ -617,6 +754,10 @@ impl Store {
     }
 
     /// Rename collection in database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
     pub fn rename_collection_documents(&self, old_name: &str, new_name: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE documents SET collection = ?1 WHERE collection = ?2",
@@ -626,6 +767,10 @@ impl Store {
     }
 
     /// Cleanup orphaned content (not referenced by any active document).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
     pub fn cleanup_orphaned_content(&self) -> Result<usize> {
         let changes = self.conn.execute(
             "DELETE FROM content WHERE hash NOT IN (SELECT DISTINCT hash FROM documents WHERE active = 1)",
@@ -635,6 +780,10 @@ impl Store {
     }
 
     /// Cleanup orphaned vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
     pub fn cleanup_orphaned_vectors(&self) -> Result<usize> {
         let changes = self.conn.execute(
             r"
@@ -647,6 +796,10 @@ impl Store {
     }
 
     /// Delete inactive documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
     pub fn delete_inactive_documents(&self) -> Result<usize> {
         let changes = self
             .conn
@@ -654,19 +807,83 @@ impl Store {
         Ok(changes)
     }
 
-    /// Clear LLM cache.
+    /// Look up a cached LLM result by cache key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn cache_get(&self, key: &str) -> Result<Option<String>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT result FROM llm_cache WHERE hash = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Store an LLM result in the cache.
+    ///
+    /// Probabilistically evicts old entries (~1 % of writes) to keep
+    /// the cache bounded at 1 000 entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
+    pub fn cache_set(&self, key: &str, result: &str) -> Result<()> {
+        let now = now_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (hash, result, created_at) VALUES (?1, ?2, ?3)",
+            params![key, result, now],
+        )?;
+
+        // Probabilistic eviction: ~1 % of writes.
+        if fastrand::u8(..) < 3 {
+            self.conn.execute(
+                "DELETE FROM llm_cache WHERE hash NOT IN \
+                 (SELECT hash FROM llm_cache ORDER BY created_at DESC LIMIT 1000)",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Build a cache key from an operation name and input body.
+    #[must_use]
+    pub fn cache_key(operation: &str, body: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(operation.as_bytes());
+        hasher.update(body.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Clear the entire LLM cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
     pub fn clear_cache(&self) -> Result<usize> {
         let changes = self.conn.execute("DELETE FROM llm_cache", [])?;
         Ok(changes)
     }
 
     /// Vacuum database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the vacuum operation fails.
     pub fn vacuum(&self) -> Result<()> {
         self.conn.execute("VACUUM", [])?;
         Ok(())
     }
 
     /// Ensure the vector table exists with the correct dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table creation fails.
     pub fn ensure_vector_table(&self, _dimensions: usize) -> Result<()> {
         // Create vectors_vec table for storing embeddings
         self.conn.execute(
@@ -682,6 +899,10 @@ impl Store {
     }
 
     /// Insert an embedding for a content hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database write fails.
     pub fn insert_embedding(
         &self,
         hash: &str,
@@ -713,6 +934,10 @@ impl Store {
     }
 
     /// Documents that need embedding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn unembedded_docs(&self) -> Result<Vec<UnembeddedDoc>> {
         let mut stmt = self.conn.prepare(
             r"SELECT DISTINCT d.hash, d.path, c.doc
@@ -736,6 +961,10 @@ impl Store {
     }
 
     /// Get embedding for a hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn get_embedding(&self, hash: &str, seq: usize) -> Result<Option<Vec<f32>>> {
         let hash_seq = format!("{hash}_{seq}");
         let result: Option<Vec<u8>> = self
@@ -756,6 +985,10 @@ impl Store {
     }
 
     /// Vector similarity search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query or embedding retrieval fails.
     pub fn search_vec(
         &self,
         query_embedding: &[f32],
@@ -831,6 +1064,10 @@ impl Store {
     }
 
     /// Clear all embeddings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
     pub fn clear_embeddings(&self) -> Result<usize> {
         let changes1 = self.conn.execute("DELETE FROM content_vectors", [])?;
         let _ = self.conn.execute("DELETE FROM vectors_vec", []);
@@ -838,6 +1075,10 @@ impl Store {
     }
 
     /// List files in a collection, optionally filtered by path prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn list_files(
         &self,
         collection: &str,
@@ -881,6 +1122,10 @@ impl Store {
     }
 
     /// Find files similar to `query` using fuzzy matching.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
     pub fn find_similar_files(&self, query: &str, limit: usize) -> Result<Vec<FuzzyMatch>> {
         use fuzzy_matcher::FuzzyMatcher;
         use fuzzy_matcher::skim::SkimMatcherV2;
@@ -911,12 +1156,16 @@ impl Store {
             })
             .collect();
 
-        hits.sort_by(|a, b| b.score.cmp(&a.score));
+        hits.sort_by_key(|b| std::cmp::Reverse(b.score));
         hits.truncate(limit);
         Ok(hits)
     }
 
     /// Match files using a glob pattern.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the glob pattern is invalid or the database query fails.
     pub fn match_files_by_glob(&self, pattern: &str) -> Result<Vec<Document>> {
         let glob_pattern = glob::Pattern::new(pattern).map_err(|e| Error::Config(e.to_string()))?;
 
@@ -959,6 +1208,207 @@ impl Store {
             )
             .collect();
 
+        Ok(results)
+    }
+
+    /// Get document body content by hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn get_body_by_hash(&self, hash: &str) -> Result<Option<String>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT doc FROM content WHERE hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Expand the user query into multiple sub-queries using LLM or cache.
+    fn expand_queries(
+        &self,
+        query: &str,
+        fts_scores: &[f64],
+        generator: Option<&crate::generate::GenerationEngine>,
+    ) -> Vec<search::Query> {
+        if search::has_strong_signal(fts_scores) || generator.is_none() {
+            return search::Query::expand_simple(query);
+        }
+
+        let cache_key = Self::cache_key("expand", query);
+        if let Ok(Some(cached)) = self.cache_get(&cache_key) {
+            return search::Query::from_llm_output(&cached, query);
+        }
+
+        generator.map_or_else(
+            || search::Query::expand_simple(query),
+            |engine| {
+                engine.expand_query(query, true).map_or_else(
+                    |_| search::Query::expand_simple(query),
+                    |expanded| {
+                        // Cache the raw LLM output for next time.
+                        let raw: String = expanded
+                            .iter()
+                            .map(|q| {
+                                let kind = match q.kind {
+                                    search::QueryType::Lex => "lex",
+                                    search::QueryType::Vec => "vec",
+                                    search::QueryType::Hyde => "hyde",
+                                };
+                                format!("{kind}: {}", q.text)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let _ = self.cache_set(&cache_key, &raw);
+                        expanded
+                    },
+                )
+            },
+        )
+    }
+
+    /// Apply reranking to the top results using the cross-encoder.
+    fn apply_reranking(
+        &self,
+        query: &str,
+        results: &mut Vec<SearchResult>,
+        limit: usize,
+        ranker: &crate::rerank::RerankEngine,
+    ) {
+        let top_n = results.len().min(limit * 2);
+        let candidates: Vec<(String, String, Option<String>)> = results[..top_n]
+            .iter()
+            .filter_map(|r| {
+                let body = self.get_body_by_hash(&r.doc.hash).ok()??;
+                Some((r.doc.display_path(), body, Some(r.doc.title.clone())))
+            })
+            .collect();
+
+        if !candidates.is_empty()
+            && let Ok(scored) = ranker.rerank(query, &candidates)
+        {
+            let mut ranked_output: Vec<SearchResult> = Vec::with_capacity(scored.len());
+            for s in &scored {
+                if let Some(pos) = results.iter().position(|r| r.doc.display_path() == s.key) {
+                    let mut r = results.swap_remove(pos);
+                    r.score = f64::from(s.score);
+                    ranked_output.push(r);
+                }
+            }
+            ranked_output.append(results);
+            *results = ranked_output;
+        }
+    }
+
+    /// Structured hybrid search pipeline.
+    ///
+    /// 1. Run initial FTS with the raw query.
+    /// 2. If a [`GenerationEngine`](crate::generate::GenerationEngine) is
+    ///    provided *and* the initial FTS lacks a strong signal, expand the
+    ///    query into multiple sub-queries (lex / vec / hyde).
+    /// 3. Run FTS + vector search for each sub-query, collecting ranked
+    ///    key lists.
+    /// 4. Fuse all lists with Reciprocal Rank Fusion (RRF).
+    /// 5. Optionally rerank the top candidates with a
+    ///    [`RerankEngine`](crate::rerank::RerankEngine).
+    /// 6. Return the final `SearchResult` list, scored and sorted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any database query or embedding operation fails.
+    pub fn structured_search(
+        &self,
+        query: &str,
+        limit: usize,
+        collection: Option<&str>,
+        embed: &mut crate::embed::EmbeddingEngine,
+        generator: Option<&crate::generate::GenerationEngine>,
+        reranker: Option<&crate::rerank::RerankEngine>,
+    ) -> Result<Vec<SearchResult>> {
+        let fetch_limit = limit * 3;
+
+        // --- 1. Initial FTS probe ---
+        let initial_fts = self
+            .search_fts(query, fetch_limit, collection)
+            .ok()
+            .unwrap_or_default();
+        let fts_scores: Vec<f64> = initial_fts.iter().map(|r| r.score).collect();
+
+        // --- 2. Query expansion (skip if strong signal) ---
+        let queries = self.expand_queries(query, &fts_scores, generator);
+
+        // --- 3. Execute sub-queries, build ranked key lists ---
+        let mut all_lists: Vec<Vec<String>> = Vec::new();
+        let mut all_weights: Vec<f64> = Vec::new();
+        let mut result_map: HashMap<String, SearchResult> = HashMap::new();
+
+        let fts_keys: Vec<String> = initial_fts.iter().map(|r| r.doc.display_path()).collect();
+        for r in initial_fts {
+            result_map.entry(r.doc.display_path()).or_insert(r);
+        }
+        if !fts_keys.is_empty() {
+            all_lists.push(fts_keys);
+            all_weights.push(1.0);
+        }
+
+        for q in &queries {
+            match q.kind {
+                search::QueryType::Lex => {
+                    if let Ok(results) = self.search_fts(&q.text, fetch_limit, collection) {
+                        let keys: Vec<String> =
+                            results.iter().map(|r| r.doc.display_path()).collect();
+                        for r in results {
+                            result_map.entry(r.doc.display_path()).or_insert(r);
+                        }
+                        if !keys.is_empty() {
+                            all_lists.push(keys);
+                            all_weights.push(0.8);
+                        }
+                    }
+                }
+                search::QueryType::Vec | search::QueryType::Hyde => {
+                    if let Ok(emb) = embed.embed_query(&q.text)
+                        && let Ok(results) = self.search_vec(&emb, fetch_limit, collection)
+                    {
+                        let keys: Vec<String> =
+                            results.iter().map(|r| r.doc.display_path()).collect();
+                        for r in results {
+                            result_map.entry(r.doc.display_path()).or_insert(r);
+                        }
+                        if !keys.is_empty() {
+                            all_lists.push(keys);
+                            all_weights.push(1.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- 4. RRF fusion ---
+        let list_refs: Vec<&[String]> = all_lists.iter().map(Vec::as_slice).collect();
+        let fused = search::rrf(&list_refs, Some(&all_weights), 60);
+
+        let mut results: Vec<SearchResult> = fused
+            .iter()
+            .filter_map(|hit| {
+                result_map.remove(&hit.key).map(|mut r| {
+                    r.score = hit.score;
+                    r
+                })
+            })
+            .collect();
+
+        // --- 5. Optional reranking ---
+        if let Some(ranker) = reranker {
+            self.apply_reranking(query, &mut results, limit, ranker);
+        }
+
+        results.truncate(limit);
+        self.attach_context(&mut results);
         Ok(results)
     }
 }

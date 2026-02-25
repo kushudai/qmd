@@ -29,6 +29,10 @@ impl std::fmt::Debug for GenerationEngine {
 
 impl GenerationEngine {
     /// Load a model from a file path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the GGUF model cannot be loaded.
     pub fn new(path: &Path) -> Result<Self> {
         let loaded = model::load_gguf(path)?;
         Ok(Self {
@@ -38,6 +42,10 @@ impl GenerationEngine {
     }
 
     /// Load the default generation model from cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model path cannot be resolved or the model fails to load.
     pub fn load_default() -> Result<Self> {
         Self::new(&model::get_path(model::GENERATE.filename)?)
     }
@@ -49,6 +57,10 @@ impl GenerationEngine {
     }
 
     /// Generate text from a prompt (up to `max_tokens`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tokenization, context creation, or inference fails.
     pub fn generate(&self, prompt: &str, max_tokens: usize) -> Result<String> {
         let ctx_params = LlamaContextParams::default().with_n_ctx(std::num::NonZero::new(4096));
 
@@ -110,6 +122,10 @@ impl GenerationEngine {
     }
 
     /// Expand a query into multiple search variations using LLM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying text generation fails.
     pub fn expand_query(&self, query: &str, include_lexical: bool) -> Result<Vec<Query>> {
         let prompt = format!(
             "/no_think Expand this search query into different forms for retrieval.\n\

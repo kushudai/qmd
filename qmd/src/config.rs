@@ -26,6 +26,10 @@ pub const EXCLUDE_DIRS: &[&str] = &[
 /// Resolve the database path for a named index.
 ///
 /// Returns `~/.cache/qmd/{index_name}.sqlite`, creating parent dirs.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be determined or created.
 pub fn db_path(index_name: &str) -> Result<PathBuf> {
     let dir = dirs::cache_dir()
         .ok_or_else(|| Error::Config("cannot determine cache directory".into()))?
@@ -37,6 +41,10 @@ pub fn db_path(index_name: &str) -> Result<PathBuf> {
 /// Resolve the config directory.
 ///
 /// Uses `$QMD_CONFIG_DIR` if set, otherwise `~/.config/qmd`.
+///
+/// # Errors
+///
+/// Returns an error if the config directory cannot be determined.
 pub fn config_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("QMD_CONFIG_DIR") {
         return Ok(PathBuf::from(dir));
@@ -49,6 +57,10 @@ pub fn config_dir() -> Result<PathBuf> {
 /// Resolve the config file path for a named index.
 ///
 /// Returns `~/.config/qmd/{index_name}.yml`.
+///
+/// # Errors
+///
+/// Returns an error if the config directory cannot be determined.
 pub fn config_path(index_name: &str) -> Result<PathBuf> {
     Ok(config_dir()?.join(format!("{index_name}.yml")))
 }
@@ -56,6 +68,10 @@ pub fn config_path(index_name: &str) -> Result<PathBuf> {
 /// Resolve the model cache directory.
 ///
 /// Returns `~/.cache/qmd/models/`, creating it if needed.
+///
+/// # Errors
+///
+/// Returns an error if the cache directory cannot be determined or created.
 pub fn model_cache_dir() -> Result<PathBuf> {
     let dir = dirs::cache_dir()
         .ok_or_else(|| Error::Config("cannot determine cache directory".into()))?
