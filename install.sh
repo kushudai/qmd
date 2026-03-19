@@ -8,7 +8,7 @@
 
 set -eu
 
-REPO="qntx/qmd"
+REPO="qntx-labs/qmd"
 BIN="qmd"
 
 BIN_UPPER=$(echo "$BIN" | tr '[:lower:]' '[:upper:]')

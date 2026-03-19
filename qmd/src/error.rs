@@ -6,7 +6,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// `SQLite` / rusqlite error.
+    /// SQLite / rusqlite error.
     #[error("database: {0}")]
     Database(#[from] rusqlite::Error),
 
@@ -14,33 +14,33 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    /// YAML serialization error.
-    #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
-
     /// JSON serialization error.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// HTTP request error.
-    #[error("http: {0}")]
-    Http(#[from] reqwest::Error),
+    /// YAML serialization error.
+    #[error("yaml: {0}")]
+    Yaml(#[from] serde_yml::Error),
+
+    /// Embedding model error.
+    #[error("embedding: {0}")]
+    Embedding(String),
+
+    /// Reranking model error.
+    #[error("rerank: {0}")]
+    Rerank(String),
 
     /// Configuration or path resolution error.
     #[error("config: {0}")]
     Config(String),
 
-    /// Collection not found.
-    #[error("collection not found: {0}")]
-    CollectionNotFound(String),
-
     /// Document not found.
-    #[error("document not found: {0}")]
-    DocumentNotFound(String),
+    #[error("not found: {0}")]
+    NotFound(String),
 
-    /// Model download, loading, or inference error.
-    #[error("model: {0}")]
-    Model(String),
+    /// Collection already exists.
+    #[error("collection already exists: {0}")]
+    CollectionExists(String),
 }
 
 /// Crate-level result alias.

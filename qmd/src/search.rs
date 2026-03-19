@@ -1,24 +1,23 @@
-//! Search utilities: query expansion, FTS5 query parsing, RRF fusion,
-//! snippet extraction, and structured search pipeline.
+//! Search utilities: FTS5 query building, RRF fusion, snippet extraction.
 
 use std::collections::HashMap;
 
 use regex::Regex;
 
 /// Search backend kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[non_exhaustive]
 pub enum QueryType {
     /// Lexical (BM25).
     Lex,
     /// Vector (semantic).
     Vec,
-    /// `HyDE` — Hypothetical Document Embedding.
+    /// HyDE — Hypothetical Document Embedding.
     Hyde,
 }
 
 /// A typed search query destined for a specific backend.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct Query {
     /// Backend kind.
@@ -28,31 +27,31 @@ pub struct Query {
 }
 
 impl Query {
-    /// Create a query with the given kind and text.
-    #[must_use]
-    pub fn new(kind: QueryType, text: impl Into<String>) -> Self {
-        Self {
-            kind,
-            text: text.into(),
-        }
-    }
-
     /// Create a lexical (BM25) query.
     #[must_use]
     pub fn lex(text: impl Into<String>) -> Self {
-        Self::new(QueryType::Lex, text)
+        Self {
+            kind: QueryType::Lex,
+            text: text.into(),
+        }
     }
 
     /// Create a vector (semantic) query.
     #[must_use]
     pub fn vec(text: impl Into<String>) -> Self {
-        Self::new(QueryType::Vec, text)
+        Self {
+            kind: QueryType::Vec,
+            text: text.into(),
+        }
     }
 
-    /// Create a `HyDE` query.
+    /// Create a HyDE query.
     #[must_use]
     pub fn hyde(text: impl Into<String>) -> Self {
-        Self::new(QueryType::Hyde, text)
+        Self {
+            kind: QueryType::Hyde,
+            text: text.into(),
+        }
     }
 
     /// Simple (non-LLM) expansion into lex + vec + hyde.
@@ -68,10 +67,10 @@ impl Query {
     /// Parse structured LLM output into typed queries.
     ///
     /// Expected format (one per line): `lex:`, `vec:`, `hyde:`.
-    /// Falls back to [`Self::expand_simple`] if no valid lines found.
+    /// Falls back to [`expand_simple`](Self::expand_simple) if no valid lines found.
     #[must_use]
-    pub fn from_llm_output(output: &str, original_query: &str) -> Vec<Self> {
-        let query_lower = original_query.to_lowercase();
+    pub fn from_llm_output(output: &str, original: &str) -> Vec<Self> {
+        let query_lower = original.to_lowercase();
         let line_re = Regex::new(r"^(lex|vec|hyde):\s*(.+)$").ok();
         let mut queries = Vec::new();
 
@@ -91,25 +90,43 @@ impl Query {
                 };
                 let text = caps[2].trim();
                 let text_lower = text.to_lowercase();
-
                 let has_overlap = query_lower
                     .split_whitespace()
                     .any(|t| t.len() >= 3 && text_lower.contains(t));
 
                 if has_overlap || query_lower.len() < 3 {
-                    queries.push(Self::new(kind, text));
+                    queries.push(Self {
+                        kind,
+                        text: text.to_string(),
+                    });
                 }
             }
         }
 
         if queries.is_empty() {
-            return Self::expand_simple(original_query);
+            Self::expand_simple(original)
+        } else {
+            queries
         }
-        queries
     }
 }
 
-/// Sanitize a single term for FTS5 (keep only letters, digits, apostrophes).
+impl<'de> serde::Deserialize<'de> for QueryType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "lex" => Ok(Self::Lex),
+            "vec" => Ok(Self::Vec),
+            "hyde" => Ok(Self::Hyde),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &["lex", "vec", "hyde"],
+            )),
+        }
+    }
+}
+
+/// Sanitize a term for FTS5 (keep only alphanumeric + apostrophes).
 fn sanitize_fts5_term(term: &str) -> String {
     term.chars()
         .filter(|c| c.is_alphanumeric() || *c == '\'')
@@ -119,12 +136,8 @@ fn sanitize_fts5_term(term: &str) -> String {
 
 /// Build an FTS5 query from user-facing search syntax.
 ///
-/// Supports:
-/// - **Quoted phrases**: `"exact phrase"` → exact match
-/// - **Negation**: `-term` or `-"phrase"` → FTS5 NOT operator
-/// - **Plain terms**: `term` → `"term"*` (prefix match)
-///
-/// Returns `None` if the query contains no usable terms.
+/// Supports quoted phrases, negation (`-term`), and prefix matching.
+/// Returns `None` if no usable terms.
 ///
 /// # Examples
 ///
@@ -134,10 +147,6 @@ fn sanitize_fts5_term(term: &str) -> String {
 /// assert_eq!(
 ///     build_fts5_query("performance -sports"),
 ///     Some(r#""performance"* NOT "sports"*"#.to_string()),
-/// );
-/// assert_eq!(
-///     build_fts5_query(r#""machine learning""#),
-///     Some(r#""machine learning""#.to_string()),
 /// );
 /// ```
 #[must_use]
@@ -150,7 +159,6 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
     let mut i = 0;
 
     while i < bytes.len() {
-        // Skip whitespace.
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
@@ -158,7 +166,6 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
             break;
         }
 
-        // Check negation prefix.
         let negated = bytes[i] == b'-';
         if negated {
             i += 1;
@@ -167,16 +174,15 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
             }
         }
 
-        // Quoted phrase.
         if bytes[i] == b'"' {
-            i += 1; // skip opening quote
+            i += 1;
             let start = i;
             while i < bytes.len() && bytes[i] != b'"' {
                 i += 1;
             }
             let phrase = &s[start..i];
             if i < bytes.len() {
-                i += 1; // skip closing quote
+                i += 1;
             }
             let sanitized: String = phrase
                 .split_whitespace()
@@ -187,35 +193,30 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
             if !sanitized.is_empty() {
                 let fts = format!("\"{sanitized}\"");
                 if negated {
-                    negative.push(fts);
+                    &mut negative
                 } else {
-                    positive.push(fts);
+                    &mut positive
                 }
+                .push(fts);
             }
         } else {
-            // Plain term (until whitespace or quote).
             let start = i;
             while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'"' {
                 i += 1;
             }
-            let term = &s[start..i];
-            let sanitized = sanitize_fts5_term(term);
+            let sanitized = sanitize_fts5_term(&s[start..i]);
             if !sanitized.is_empty() {
                 let fts = format!("\"{sanitized}\"*");
                 if negated {
-                    negative.push(fts);
+                    &mut negative
                 } else {
-                    positive.push(fts);
+                    &mut positive
                 }
+                .push(fts);
             }
         }
     }
 
-    if positive.is_empty() && negative.is_empty() {
-        return None;
-    }
-
-    // If only negative terms, nothing to match against.
     if positive.is_empty() {
         return None;
     }
@@ -227,223 +228,72 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
     Some(result)
 }
 
-/// Normalized BM25 score above which the top result is considered strong.
-const STRONG_TOP_THRESHOLD: f64 = 0.85;
-
-/// Minimum gap between top score and the 5th score for a clear signal.
-const STRONG_GAP_THRESHOLD: f64 = 0.15;
-
-/// Monotonic mapping of raw BM25 scores to `[0, 1)`: `x / (1 + x)`.
-///
-/// Assumes `score` is already non-negative (negated from `SQLite`'s BM25).
+/// Monotonic mapping of raw BM25 to `[0, 1)`: `x / (1 + x)`.
 #[must_use]
 pub fn normalize_bm25(score: f64) -> f64 {
     let s = score.abs();
     s / (1.0 + s)
 }
 
-/// Check whether FTS results are strong enough to skip LLM expansion.
-///
-/// Returns `true` when the top normalized score is high *and* there is
-/// a clear gap between the top and 5th-ranked score, indicating BM25
-/// alone found highly relevant results.
-#[must_use]
-pub fn has_strong_signal(fts_scores: &[f64]) -> bool {
-    if fts_scores.len() < 3 {
-        return false;
-    }
-    let top = fts_scores.first().copied().unwrap_or(0.0);
-    let fifth = fts_scores.get(4).copied().unwrap_or(0.0);
-    top >= STRONG_TOP_THRESHOLD && (top - fifth) >= STRONG_GAP_THRESHOLD
-}
-
-/// A fused RRF result carrying a key and merged score.
+/// A fused RRF result.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RrfHit {
-    /// Document key (typically `collection/path`).
+    /// Document key.
     pub key: String,
     /// Merged RRF score.
     pub score: f64,
-    /// Best rank across all input lists (0-indexed).
-    pub best_rank: usize,
 }
 
 /// Reciprocal Rank Fusion over multiple ranked key lists.
 ///
-/// `RRF(d) = Σ weight_i / (k + rank_i + 1)` with position bonuses.
+/// `RRF(d) = Σ weight_i / (k + rank_i + 1)`.
 #[must_use]
 pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit> {
-    let mut scores: HashMap<&str, (f64, usize)> = HashMap::new();
+    let mut scores: HashMap<&str, f64> = HashMap::new();
 
     for (list_idx, keys) in lists.iter().enumerate() {
         let w = weights
             .and_then(|ws| ws.get(list_idx))
             .copied()
             .unwrap_or(1.0);
-
         for (rank, key) in keys.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             let s = w / (k + rank + 1) as f64;
-            scores
-                .entry(key.as_str())
-                .and_modify(|(acc, best)| {
-                    *acc += s;
-                    *best = (*best).min(rank);
-                })
-                .or_insert((s, rank));
+            *scores.entry(key.as_str()).or_default() += s;
         }
     }
 
     let mut hits: Vec<RrfHit> = scores
         .into_iter()
-        .map(|(key, (score, best_rank))| {
-            let bonus = match best_rank {
-                0..=2 => 0.08,
-                3..=9 => 0.04,
-                10..=19 => 0.01,
-                _ => 0.0,
-            };
-            RrfHit {
-                key: key.to_string(),
-                score: score + bonus,
-                best_rank,
-            }
+        .map(|(key, score)| RrfHit {
+            key: key.to_string(),
+            score,
         })
         .collect();
-
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     hits
 }
 
-/// Normalize a slice of scores to `[0, 1]` using min-max scaling.
+/// Extract a relevant snippet from `body` around query terms.
 #[must_use]
-pub fn normalize_scores(scores: &[f64]) -> Vec<f64> {
-    if scores.is_empty() {
-        return Vec::new();
-    }
-    let min = scores.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let range = max - min;
-    if range < f64::EPSILON {
-        return vec![1.0; scores.len()];
-    }
-    scores.iter().map(|s| (s - min) / range).collect()
-}
-
-/// An extracted snippet with its starting line number.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Snippet {
-    /// Snippet text.
-    pub text: String,
-    /// 1-indexed line number.
-    pub line: usize,
-}
-
-impl Snippet {
-    /// Diff-style header: `@@ -line,count @@`.
-    #[must_use]
-    pub fn header(&self) -> String {
-        let count = self.text.lines().count();
-        format!("@@ -{},{count} @@", self.line)
-    }
-
-    /// Snippet text prefixed with a diff-style header.
-    #[must_use]
-    pub fn with_header(&self) -> String {
-        format!("{}\n{}", self.header(), self.text)
-    }
-}
-
-/// Extract a relevant snippet from `body` around query terms or `chunk_pos`.
-#[must_use]
-pub fn extract_snippet(
-    body: &str,
-    query: &str,
-    max_chars: usize,
-    chunk_pos: Option<usize>,
-) -> Snippet {
+pub fn extract_snippet(body: &str, query: &str, max_chars: usize) -> String {
     if body.len() <= max_chars {
-        return Snippet {
-            text: body.to_string(),
-            line: 1,
-        };
+        return body.to_string();
     }
 
     let body_lower = body.to_lowercase();
-    let start_pos = chunk_pos.map_or_else(
-        || {
-            query
-                .split_whitespace()
-                .filter(|t| t.len() >= 3)
-                .find_map(|t| body_lower.find(&t.to_lowercase()))
-                .map_or(0, |p| p.saturating_sub(50))
-        },
-        |pos| pos.min(body.len().saturating_sub(max_chars)),
-    );
+    let start_pos = query
+        .split_whitespace()
+        .filter(|t| t.len() >= 3)
+        .find_map(|t| body_lower.find(&t.to_lowercase()))
+        .map_or(0, |p| p.saturating_sub(50));
 
     let line_start = body[..start_pos].rfind('\n').map_or(0, |p| p + 1);
     let end_pos = (line_start + max_chars).min(body.len());
     let line_end = body[end_pos..]
         .find('\n')
         .map_or(body.len(), |p| end_pos + p);
-    let line = body[..line_start].matches('\n').count() + 1;
 
-    Snippet {
-        text: body[line_start..line_end].to_string(),
-        line,
-    }
-}
-
-/// Validate a lexical (BM25) query string.
-///
-/// Returns `None` if the query is valid, or `Some(reason)` describing
-/// why it is unsuitable for FTS search.
-#[must_use]
-pub fn validate_lex_query(query: &str) -> Option<&'static str> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return Some("query is empty");
-    }
-    if trimmed.len() < 2 {
-        return Some("query too short (minimum 2 characters)");
-    }
-    // All-punctuation queries won't match anything useful.
-    if trimmed
-        .chars()
-        .all(|c| c.is_ascii_punctuation() || c.is_whitespace())
-    {
-        return Some("query contains only punctuation");
-    }
-    None
-}
-
-/// Validate a semantic (vector) query string.
-///
-/// Returns `None` if the query is valid, or `Some(reason)` describing
-/// why it is unsuitable for embedding-based search.
-#[must_use]
-pub fn validate_vec_query(query: &str) -> Option<&'static str> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return Some("query is empty");
-    }
-    if trimmed.len() < 3 {
-        return Some("query too short for semantic search (minimum 3 characters)");
-    }
-    if trimmed.split_whitespace().count() > 200 {
-        return Some("query too long (maximum 200 words)");
-    }
-    None
-}
-
-/// Add line numbers to text content (1-indexed).
-#[must_use]
-pub fn add_line_numbers(text: &str, start_line: usize) -> String {
-    text.lines()
-        .enumerate()
-        .map(|(i, line)| format!("{}: {line}", start_line + i))
-        .collect::<Vec<_>>()
-        .join("\n")
+    body[line_start..line_end].to_string()
 }

@@ -7,7 +7,7 @@
 
 $ErrorActionPreference = "Stop"
 $InformationPreference = "Continue"
-$Repo = "qntx/qmd"
+$Repo = "qntx-labs/qmd"
 $Bin = "qmd"
 
 $BinUpper = $Bin.ToUpper()
