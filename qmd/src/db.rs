@@ -221,30 +221,49 @@ impl Db {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Self::init_connection(Connection::open(path)?)?;
-        let db = Self { conn, dims: None };
+        Self::register_sqlite_vec();
+        let db = Self {
+            conn: Connection::open(path)?,
+            dims: None,
+        };
         db.migrate()?;
         Ok(db)
     }
 
     /// Open an in-memory database (useful for tests).
     pub fn open_memory() -> Result<Self> {
-        let conn = Self::init_connection(Connection::open_in_memory()?)?;
-        let db = Self { conn, dims: None };
+        Self::register_sqlite_vec();
+        let db = Self {
+            conn: Connection::open_in_memory()?,
+            dims: None,
+        };
         db.migrate()?;
         Ok(db)
     }
 
-    /// Register sqlite-vec extension and return the connection.
-    #[allow(clippy::unnecessary_wraps)]
-    fn init_connection(conn: Connection) -> Result<Connection> {
-        #[allow(unsafe_code, clippy::missing_transmute_annotations)]
-        unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
-        Ok(conn)
+    /// Register the `sqlite-vec` extension as a SQLite auto-extension.
+    ///
+    /// `sqlite3_auto_extension` registers an init callback that runs against
+    /// every connection opened *after* the call. We must therefore register
+    /// it **before** `Connection::open(...)`, not after — otherwise the
+    /// connection we use never sees the `vec0` virtual-table module and
+    /// every `CREATE VIRTUAL TABLE ... USING vec0(...)` fails with
+    /// `no such module: vec0`.
+    ///
+    /// `sqlite3_auto_extension` deduplicates internally, but we still wrap
+    /// it in a `Once` to keep the unsafe surface tiny and avoid repeating
+    /// the FFI dance on every `open`.
+    fn register_sqlite_vec() {
+        use std::sync::Once;
+        static REGISTER: Once = Once::new();
+        REGISTER.call_once(|| {
+            #[allow(unsafe_code, clippy::missing_transmute_annotations)]
+            unsafe {
+                rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                    sqlite_vec::sqlite3_vec_init as *const (),
+                )));
+            }
+        });
     }
 
     /// Run schema migrations.
