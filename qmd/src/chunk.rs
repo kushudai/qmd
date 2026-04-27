@@ -114,7 +114,7 @@ impl Chunker {
 ///
 /// Equivalent to the unstable [`str::floor_char_boundary`]; reimplemented here
 /// to stay on stable Rust.
-fn floor_char_boundary(s: &str, idx: usize) -> usize {
+pub(crate) fn floor_char_boundary(s: &str, idx: usize) -> usize {
     let mut i = idx.min(s.len());
     while i > 0 && !s.is_char_boundary(i) {
         i -= 1;
@@ -123,7 +123,7 @@ fn floor_char_boundary(s: &str, idx: usize) -> usize {
 }
 
 /// Return the smallest index `>= idx` that lies on a UTF-8 char boundary.
-fn ceil_char_boundary(s: &str, idx: usize) -> usize {
+pub(crate) fn ceil_char_boundary(s: &str, idx: usize) -> usize {
     let mut i = idx.min(s.len());
     while i < s.len() && !s.is_char_boundary(i) {
         i += 1;

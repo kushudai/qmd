@@ -276,6 +276,10 @@ pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit
 }
 
 /// Extract a relevant snippet from `body` around query terms.
+///
+/// All offsets are snapped to UTF-8 char boundaries before slicing, so a
+/// multi-byte character (`→`, `×`, em-dash, …) at a snippet boundary cannot
+/// panic the search pipeline.
 #[must_use]
 pub fn extract_snippet(body: &str, query: &str, max_chars: usize) -> String {
     if body.len() <= max_chars {
@@ -283,17 +287,57 @@ pub fn extract_snippet(body: &str, query: &str, max_chars: usize) -> String {
     }
 
     let body_lower = body.to_lowercase();
-    let start_pos = query
+    let raw_start = query
         .split_whitespace()
         .filter(|t| t.len() >= 3)
         .find_map(|t| body_lower.find(&t.to_lowercase()))
         .map_or(0, |p| p.saturating_sub(50));
+    let start_pos = crate::chunk::floor_char_boundary(body, raw_start);
 
     let line_start = body[..start_pos].rfind('\n').map_or(0, |p| p + 1);
-    let end_pos = (line_start + max_chars).min(body.len());
+    let raw_end = (line_start + max_chars).min(body.len());
+    let end_pos = crate::chunk::floor_char_boundary(body, raw_end);
     let line_end = body[end_pos..]
         .find('\n')
         .map_or(body.len(), |p| end_pos + p);
 
     body[line_start..line_end].to_string()
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::extract_snippet;
+
+    #[test]
+    fn short_body_returned_verbatim() {
+        let body = "tiny — body";
+        let s = extract_snippet(body, "body", 4096);
+        assert_eq!(s, body);
+    }
+
+    #[test]
+    fn multibyte_char_at_end_boundary_does_not_panic() {
+        // Reproduces the `→` (U+2192, 3 bytes) panic at `search.rs:294`:
+        // a multi-byte char straddling `line_start + max_chars`.
+        //
+        // Layout: 3998 ASCII bytes, then `→` (3 bytes) at byte 3998..4001.
+        // With max_chars = 4000 the naive end_pos lands inside `→`.
+        let mut body = String::with_capacity(5000);
+        body.push_str(&"a".repeat(3998));
+        body.push('→');
+        body.push_str(&"b".repeat(1000));
+
+        let s = extract_snippet(&body, "search", 4000);
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn multibyte_char_near_query_match_does_not_panic() {
+        // The 50-byte left-pad before the query match can also land inside
+        // a multi-byte char.
+        let body = format!("{}→needle and the rest", "x".repeat(60));
+        let s = extract_snippet(&body, "needle", 50);
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+        assert!(s.contains("needle"));
+    }
 }
