@@ -6,11 +6,15 @@
 //! `__isoc23_strtoll` / `__isoc23_strtol` / `__isoc23_strtoull`.
 //!
 //! On older glibc (e.g. Ubuntu 22.04, which ships glibc 2.35) those symbols
-//! don't exist, and linking the `qmd` binary fails with
+//! don't exist, and linking any binary that pulls in `qmd` fails with
 //!
 //! ```text
 //! rust-lld: error: undefined symbol: __isoc23_strtoll
 //! ```
+//!
+//! That includes `qmd-cli`, downstream consumers of this crate, **and**
+//! qmd's own doctests/benches/integration tests, since they all link the
+//! crate's transitive deps (fastembed → ort).
 //!
 //! The C23 variants behave identically to the un-prefixed functions except
 //! they additionally accept `0b...` binary literals when `base` is 0 or 2.
@@ -18,11 +22,26 @@
 //! JSON numbers and integer config values), so we can safely satisfy the
 //! references by delegating to the plain libc functions.
 //!
-//! These shims are only emitted on `target_os = "linux"` with the GNU libc
-//! environment. Other targets (musl, macOS, Windows) don't need them and
-//! the module compiles to nothing.
+//! Gated behind the default-on `glibc-compat` feature and only emitted on
+//! `target_os = "linux"` with the GNU libc environment. Downstream users
+//! on glibc ≥ 2.38 can disable the feature with `default-features = false`
+//! if they want the real glibc implementations to win.
 
-#![cfg(all(target_os = "linux", target_env = "gnu"))]
+#![cfg(all(feature = "glibc-compat", target_os = "linux", target_env = "gnu"))]
+// The whole module is one big intentional pile of FFI: `unsafe extern` blocks,
+// `#[no_mangle]` symbol exports, `unsafe fn` declarations, and `unsafe { … }`
+// calls. These are exactly what the workspace lints (`unsafe_code`,
+// `clippy::multiple_unsafe_ops_per_block`, `clippy::missing_docs_in_private_items`,
+// etc.) flag — and they cannot be avoided here.
+#![allow(
+    unsafe_code,
+    missing_docs,
+    clippy::missing_docs_in_private_items,
+    clippy::missing_safety_doc,
+    clippy::multiple_unsafe_ops_per_block,
+    clippy::undocumented_unsafe_blocks,
+    clippy::unnecessary_safety_comment
+)]
 
 use std::os::raw::{c_char, c_int, c_long, c_longlong, c_ulonglong};
 

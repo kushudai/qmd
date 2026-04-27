@@ -14,6 +14,16 @@ categories = ["text-processing", "database"]
 name = "qmd"
 path = "src/lib.rs"
 
+[features]
+default = ["glibc-compat"]
+
+# Provide a `__isoc23_strto*` shim so binaries that pull in this crate
+# (including doctests, integration tests, and qmd-cli) can link on glibc
+# < 2.38, where the C23-versioned symbols don't exist. See
+# `src/glibc_compat.rs` for details. Disable with `default-features = false`
+# if your target glibc already exports these symbols.
+glibc-compat = []
+
 [dependencies]
 fastembed.workspace = true
 ignore.workspace = true
