@@ -7,6 +7,8 @@
     missing_docs
 )]
 
+mod glibc_compat;
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
