@@ -126,17 +126,33 @@ impl<'de> serde::Deserialize<'de> for QueryType {
     }
 }
 
-/// Sanitize a term for FTS5 (keep only alphanumeric + apostrophes).
-fn sanitize_fts5_term(term: &str) -> String {
-    term.chars()
-        .filter(|c| c.is_alphanumeric() || *c == '\'')
-        .collect::<String>()
-        .to_lowercase()
+/// Sanitize a term into FTS5-safe sub-tokens.
+///
+/// The FTS5 virtual table uses `tokenize='porter unicode61'`, which splits the
+/// indexed text on every non-alphanumeric character — including `_` and `-`.
+/// So an identifier like `should_notify` is indexed as the two tokens
+/// `should` and `notify`. Stripping the underscore and concatenating the
+/// halves into `shouldnotify` (the previous behaviour) produced a token
+/// that never appears in the index, returning zero matches for any
+/// snake_case or kebab-case query.
+///
+/// Instead, split on disallowed characters and return each non-empty
+/// alphanumeric run as its own sub-token. Callers decide how to combine
+/// them (as a phrase or as ANDed prefix terms).
+fn sanitize_fts5_term(term: &str) -> Vec<String> {
+    term.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// Build an FTS5 query from user-facing search syntax.
 ///
-/// Supports quoted phrases, negation (`-term`), and prefix matching.
+/// Supports quoted phrases, negation (`-term`), and prefix matching. Bare
+/// terms become prefix searches (`tokio` → `"tokio"*`). Punctuated
+/// identifiers like `should_notify` and `tokio-rt` are split on the
+/// punctuation and emitted as a phrase (`"should notify"`) so they match
+/// the sub-tokens that FTS5's `unicode61` tokenizer actually stored.
 /// Returns `None` if no usable terms.
 ///
 /// # Examples
@@ -147,6 +163,10 @@ fn sanitize_fts5_term(term: &str) -> String {
 /// assert_eq!(
 ///     build_fts5_query("performance -sports"),
 ///     Some(r#""performance"* NOT "sports"*"#.to_string()),
+/// );
+/// assert_eq!(
+///     build_fts5_query("should_notify"),
+///     Some(r#""should notify""#.to_string()),
 /// );
 /// ```
 #[must_use]
@@ -184,14 +204,15 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
             if i < bytes.len() {
                 i += 1;
             }
-            let sanitized: String = phrase
+            // Quoted phrase: flatten every word into its sub-tokens and emit
+            // them as a single phrase. e.g. `"some_func returns"` becomes
+            // `"some func returns"` so FTS5 matches the indexed token sequence.
+            let tokens: Vec<String> = phrase
                 .split_whitespace()
-                .map(sanitize_fts5_term)
-                .filter(|w| !w.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if !sanitized.is_empty() {
-                let fts = format!("\"{sanitized}\"");
+                .flat_map(sanitize_fts5_term)
+                .collect();
+            if !tokens.is_empty() {
+                let fts = format!("\"{}\"", tokens.join(" "));
                 if negated {
                     &mut negative
                 } else {
@@ -204,15 +225,24 @@ pub fn build_fts5_query(query: &str) -> Option<String> {
             while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'"' {
                 i += 1;
             }
-            let sanitized = sanitize_fts5_term(&s[start..i]);
-            if !sanitized.is_empty() {
-                let fts = format!("\"{sanitized}\"*");
+            // Bare term: a single alphanumeric run gets prefix-matched
+            // (`tok` -> `"tok"*` matches `tokio`); a punctuated identifier
+            // like `should_notify` becomes the phrase `"should notify"` so
+            // it matches the underlying tokens FTS5 actually stored, without
+            // a prefix star (the user typed two complete words).
+            let tokens = sanitize_fts5_term(&s[start..i]);
+            let fts = match tokens.as_slice() {
+                [] => None,
+                [tok] => Some(format!("\"{tok}\"*")),
+                toks => Some(format!("\"{}\"", toks.join(" "))),
+            };
+            if let Some(clause) = fts {
                 if negated {
                     &mut negative
                 } else {
                     &mut positive
                 }
-                .push(fts);
+                .push(clause);
             }
         }
     }
@@ -276,6 +306,10 @@ pub fn rrf(lists: &[&[String]], weights: Option<&[f64]>, k: usize) -> Vec<RrfHit
 }
 
 /// Extract a relevant snippet from `body` around query terms.
+///
+/// All offsets are snapped to UTF-8 char boundaries before slicing, so a
+/// multi-byte character (`→`, `×`, em-dash, …) at a snippet boundary cannot
+/// panic the search pipeline.
 #[must_use]
 pub fn extract_snippet(body: &str, query: &str, max_chars: usize) -> String {
     if body.len() <= max_chars {
@@ -283,17 +317,127 @@ pub fn extract_snippet(body: &str, query: &str, max_chars: usize) -> String {
     }
 
     let body_lower = body.to_lowercase();
-    let start_pos = query
+    let raw_start = query
         .split_whitespace()
         .filter(|t| t.len() >= 3)
         .find_map(|t| body_lower.find(&t.to_lowercase()))
         .map_or(0, |p| p.saturating_sub(50));
+    let start_pos = crate::chunk::floor_char_boundary(body, raw_start);
 
     let line_start = body[..start_pos].rfind('\n').map_or(0, |p| p + 1);
-    let end_pos = (line_start + max_chars).min(body.len());
+    let raw_end = (line_start + max_chars).min(body.len());
+    let end_pos = crate::chunk::floor_char_boundary(body, raw_end);
     let line_end = body[end_pos..]
         .find('\n')
         .map_or(body.len(), |p| end_pos + p);
 
     body[line_start..line_end].to_string()
+}
+
+#[cfg(test)]
+mod fts_query_tests {
+    use super::build_fts5_query;
+
+    #[test]
+    fn bare_word_becomes_prefix_match() {
+        assert_eq!(build_fts5_query("tokio"), Some(r#""tokio"*"#.to_string()));
+    }
+
+    #[test]
+    fn snake_case_becomes_phrase() {
+        // The previous behaviour stripped the underscore and produced
+        // "shouldnotify"*, which matches nothing in the index because the
+        // unicode61 tokenizer split the indexed text on the underscore.
+        assert_eq!(
+            build_fts5_query("should_notify"),
+            Some(r#""should notify""#.to_string()),
+        );
+    }
+
+    #[test]
+    fn kebab_case_becomes_phrase() {
+        assert_eq!(
+            build_fts5_query("tokio-rt"),
+            Some(r#""tokio rt""#.to_string())
+        );
+    }
+
+    #[test]
+    fn dotted_identifier_becomes_phrase() {
+        assert_eq!(
+            build_fts5_query("std::sync::Mutex"),
+            Some(r#""std sync mutex""#.to_string()),
+        );
+    }
+
+    #[test]
+    fn negation_with_punctuation() {
+        assert_eq!(
+            build_fts5_query("perf -should_notify"),
+            Some(r#""perf"* NOT "should notify""#.to_string()),
+        );
+    }
+
+    #[test]
+    fn quoted_phrase_with_punctuation_flattens() {
+        // Quoted phrase: every word's sub-tokens are flattened into the
+        // phrase so the FTS5 phrase matches the indexed token sequence.
+        assert_eq!(
+            build_fts5_query(r#""should_notify regression""#),
+            Some(r#""should notify regression""#.to_string()),
+        );
+    }
+
+    #[test]
+    fn pure_punctuation_returns_none() {
+        assert_eq!(build_fts5_query("---"), None);
+        assert_eq!(build_fts5_query(""), None);
+        assert_eq!(build_fts5_query("   "), None);
+    }
+
+    #[test]
+    fn apostrophes_are_preserved() {
+        assert_eq!(
+            build_fts5_query("don't worry"),
+            Some(r#""don't"* "worry"*"#.to_string()),
+        );
+    }
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::extract_snippet;
+
+    #[test]
+    fn short_body_returned_verbatim() {
+        let body = "tiny — body";
+        let s = extract_snippet(body, "body", 4096);
+        assert_eq!(s, body);
+    }
+
+    #[test]
+    fn multibyte_char_at_end_boundary_does_not_panic() {
+        // Reproduces the `→` (U+2192, 3 bytes) panic at `search.rs:294`:
+        // a multi-byte char straddling `line_start + max_chars`.
+        //
+        // Layout: 3998 ASCII bytes, then `→` (3 bytes) at byte 3998..4001.
+        // With max_chars = 4000 the naive end_pos lands inside `→`.
+        let mut body = String::with_capacity(5000);
+        body.push_str(&"a".repeat(3998));
+        body.push('→');
+        body.push_str(&"b".repeat(1000));
+
+        let s = extract_snippet(&body, "search", 4000);
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn multibyte_char_near_query_match_does_not_panic() {
+        // The 50-byte left-pad before the query match can also land inside
+        // a multi-byte char.
+        let body = format!("{}→needle and the rest", "x".repeat(60));
+        let s = extract_snippet(&body, "needle", 50);
+        assert!(std::str::from_utf8(s.as_bytes()).is_ok());
+        assert!(s.contains("needle"));
+    }
 }

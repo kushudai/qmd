@@ -25,6 +25,7 @@ pub mod chunk;
 pub mod db;
 pub mod embed;
 pub mod error;
+mod glibc_compat;
 pub mod qmd;
 pub mod rerank;
 pub mod search;
