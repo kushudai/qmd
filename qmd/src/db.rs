@@ -328,47 +328,60 @@ impl Db {
         Ok(())
     }
 
-    /// Create FTS synchronization triggers if absent.
+    /// (Re)create FTS synchronization triggers.
+    ///
+    /// The triggers are dropped and recreated unconditionally so existing
+    /// databases pick up trigger-body fixes on the next open without needing
+    /// an explicit migration step. This is cheap — it's just three small
+    /// `sqlite_master` rows — and qmd already owns these triggers entirely.
     fn ensure_fts_triggers(&self) -> Result<()> {
-        let exists: bool = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='documents_ai'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        // The AFTER UPDATE trigger used to read
+        //
+        //     INSERT OR REPLACE INTO documents_fts(rowid, …) SELECT … WHERE new.active = 1;
+        //
+        // which fails with `constraint failed` whenever the trigger fires
+        // from an UPSERT (`INSERT … ON CONFLICT DO UPDATE`, which is exactly
+        // what `upsert_document` uses): the outer statement's implicit ABORT
+        // resolution takes precedence over the trigger's `OR REPLACE`, so
+        // FTS5's internal insert into `documents_fts_content` hits a
+        // PRIMARY KEY collision on the existing rowid and the whole UPSERT
+        // aborts. Same trigger body works fine when fired from a plain
+        // UPDATE — only UPSERT-fired triggers are affected.
+        //
+        // The fix is the canonical FTS5-sync idiom: unconditionally DELETE
+        // the old shadow row first, then plain INSERT a fresh one when the
+        // doc is still active. No `OR REPLACE`, so no resolution to override.
+        self.conn.execute_batch(
+            r"
+            DROP TRIGGER IF EXISTS documents_ai;
+            DROP TRIGGER IF EXISTS documents_ad;
+            DROP TRIGGER IF EXISTS documents_au;
 
-        if !exists {
-            self.conn.execute_batch(
-                r"
-                CREATE TRIGGER documents_ai AFTER INSERT ON documents
-                WHEN new.active = 1
-                BEGIN
-                    INSERT INTO documents_fts(rowid, filepath, title, body)
-                    SELECT new.id,
-                           new.collection || '/' || new.path,
-                           new.title,
-                           (SELECT doc FROM content WHERE hash = new.hash)
-                    WHERE new.active = 1;
-                END;
+            CREATE TRIGGER documents_ai AFTER INSERT ON documents
+            WHEN new.active = 1
+            BEGIN
+                INSERT INTO documents_fts(rowid, filepath, title, body)
+                SELECT new.id,
+                       new.collection || '/' || new.path,
+                       new.title,
+                       (SELECT doc FROM content WHERE hash = new.hash);
+            END;
 
-                CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
-                    DELETE FROM documents_fts WHERE rowid = old.id;
-                END;
+            CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+                DELETE FROM documents_fts WHERE rowid = old.id;
+            END;
 
-                CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
-                    DELETE FROM documents_fts WHERE rowid = old.id AND new.active = 0;
-                    INSERT OR REPLACE INTO documents_fts(rowid, filepath, title, body)
-                    SELECT new.id,
-                           new.collection || '/' || new.path,
-                           new.title,
-                           (SELECT doc FROM content WHERE hash = new.hash)
-                    WHERE new.active = 1;
-                END;
-                ",
-            )?;
-        }
+            CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
+                DELETE FROM documents_fts WHERE rowid = old.id;
+                INSERT INTO documents_fts(rowid, filepath, title, body)
+                SELECT new.id,
+                       new.collection || '/' || new.path,
+                       new.title,
+                       (SELECT doc FROM content WHERE hash = new.hash)
+                WHERE new.active = 1;
+            END;
+            ",
+        )?;
         Ok(())
     }
 
@@ -1315,6 +1328,42 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].doc.title, "Rust Ownership");
         assert_eq!(results[0].source, SearchSource::Fts);
+    }
+
+    /// Regression test for a `constraint failed` raised by `documents_au`
+    /// when fired from the upsert (`INSERT … ON CONFLICT DO UPDATE`) path.
+    ///
+    /// The first call inserts the document; the second call upserts a new
+    /// content hash, which fires the AFTER UPDATE trigger and used to raise
+    /// `SQLITE_CONSTRAINT` when the trigger body's `INSERT OR REPLACE` had
+    /// its `OR REPLACE` overridden by the outer UPSERT's resolution. After
+    /// the trigger fix (DELETE then plain INSERT) both calls succeed and
+    /// FTS5 returns only the post-update title/body.
+    #[test]
+    fn test_upsert_then_re_upsert_changed_content_keeps_fts_consistent() {
+        let db = mem_db();
+
+        let h1 = hash_content("# Old Title\nOld body about apples.");
+        db.insert_content(&h1, "# Old Title\nOld body about apples.")
+            .unwrap();
+        db.upsert_document("docs", "page.md", "Old Title", &h1)
+            .unwrap();
+
+        let h2 = hash_content("# New Title\nNew body about bananas.");
+        db.insert_content(&h2, "# New Title\nNew body about bananas.")
+            .unwrap();
+        // Before the trigger fix this raised `Error: database: constraint failed`.
+        db.upsert_document("docs", "page.md", "New Title", &h2)
+            .unwrap();
+
+        let old_results = db.search_fts("\"apples\"", 10, None).unwrap();
+        assert!(
+            old_results.is_empty(),
+            "old body should be absent from FTS after upsert"
+        );
+        let new_results = db.search_fts("\"bananas\"", 10, None).unwrap();
+        assert_eq!(new_results.len(), 1);
+        assert_eq!(new_results[0].doc.title, "New Title");
     }
 
     #[test]
